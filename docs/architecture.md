@@ -9,7 +9,11 @@ GitHub issues.
 
 This describes the **target** architecture. The repository is currently being
 bootstrapped, so everything below is *planned* unless a section says otherwise;
-as code lands, sections should note what is implemented versus planned.
+as code lands, sections should note what is implemented versus planned. The
+**backend API facts** the design depends on — conditional writes, cross-region
+copy, multipart — are verified against the providers' docs and Go SDKs; the
+evidence and exact API surfaces live in
+[`cloud-backend-research.md`](cloud-backend-research.md).
 
 ## What this project is
 
@@ -133,6 +137,13 @@ A failed precondition is the sentinel `ErrPreconditionFailed`, distinct from
 `ErrNotFound`. Conditional support is advertised as the `ConditionalWrites`
 capability; a backend without it cannot host the lock or any CAS utility.
 
+All three production backends also support **conditional delete** (S3 natively
+since 2025-09; GCS and Azure all along), so a lock's safe release is a single
+atomic op — blobster needs no CAS-to-tombstone workaround. Every backend returns
+**HTTP 412** on a failed precondition, mapped to `ErrPreconditionFailed`; the
+per-SDK error matching is recorded in
+[`cloud-backend-research.md`](cloud-backend-research.md).
+
 ## Optional capabilities
 
 Each is a Go interface a driver may also implement, paired with a flag in the
@@ -180,7 +191,10 @@ is no "region" to cross, but the interface is satisfied for uniform testing.
 A lock is a **generic algorithm over the conditional-write primitive**, not
 per-driver code: the `lock` package works on any `Bucket` that advertises
 `ConditionalWrites`. Only the conditional primitive differs between backends;
-the lease logic is shared.
+the lease logic is shared. (Azure has a native `Lease Blob` API, but it yields
+no fencing token, so blobster builds the lock on uniform CAS everywhere; a native
+lease is at most an optional Azure-specific optimization, never the core
+algorithm.)
 
 A lock named `N` is backed by a single record at `.blobster/locks/<N>` holding:
 
@@ -222,6 +236,12 @@ Clock handling, the safety margin between renew interval and lease length, and
 behavior on backend unavailability are spelled out by the implementing issue and
 this section is updated when it lands.
 
+**Backend constraint on timing.** GCS throttles writes to ~1 per second *per
+object name*. Because the lock record is a single hot object, lease and renew
+intervals must be second-scale (not sub-second), with jittered backoff on
+throttling. This effectively sets the floor for the renew/lease margin uniformly
+across backends — see [`cloud-backend-research.md`](cloud-backend-research.md).
+
 ## Multipart parallel upload
 
 The `multipart` package is a generic helper over the `MultipartUploader`
@@ -233,6 +253,19 @@ backend lacks native multipart (`mem`/`file`), the local implementation behind
 the same interface keeps the helper usable in tests and for small/local
 deployments. Resumable uploads (persisting an upload id for later continuation)
 are a backlog item, not part of the first cut.
+
+**The interface is backend-honest, not S3-mirrored.** Only S3 has a native
+upload-id / part / complete / abort model. GCS uses **compose** (parallel
+composite upload over temp components placed under `.blobster/multipart/`; the
+S3-compatible XML multipart API is unavailable in the Go SDK, so blobster does
+not use it), and Azure uses **block blobs** (`StageBlock` + `CommitBlockList`).
+Consequently `uploadID` and the per-part token are **blobster-owned opaque
+values** — real handles on S3, synthesized on GCS/Azure — and `Abort` is
+**best-effort cleanup**: S3 calls the real abort, GCS deletes its temp
+components, Azure relies on uncommitted-block GC. Azure offers no per-upload
+isolation on a key, so part/block ids are namespaced by `uploadID`. Per-backend
+mechanisms and limits are in
+[`cloud-backend-research.md`](cloud-backend-research.md).
 
 ## Cross-region copy
 
@@ -252,6 +285,15 @@ Because some backends copy synchronously and others asynchronously, the API
 returns a `CopyOperation` handle with `Wait(ctx)` / `Poll(ctx)`; a synchronous
 backend returns an already-complete handle. Cancellation propagates to the
 underlying operation where the backend supports it.
+
+**Verified constraints** (see [`cloud-backend-research.md`](cloud-backend-research.md)):
+cross-region copy is genuinely server-side on all three, but S3's only works
+*within one AWS partition* (`aws` / `aws-cn` / `aws-us-gov` cannot be crossed,
+and Transfer Acceleration and VPC gateway endpoints break it); GCS must drive the
+`rewrite` token loop (the single-shot `copy` fails on large or cross-location
+objects) via the global endpoint; and Azure requires a **read SAS on a
+cross-account source** — which must never be logged — and permits only one
+pending copy per destination.
 
 ## Code layout
 
@@ -274,6 +316,7 @@ internal/            ← shared etag/condition plumbing, not part of the public 
 docs/
   architecture.md    ← this document
   roadmap.md         ← planning backlog
+  cloud-backend-research.md  ← verified backend API facts behind the design
 AGENTS.md            ← how we work  (CLAUDE.md is a symlink to it)
 README.md  LICENSE  go.mod  Makefile
 ```
