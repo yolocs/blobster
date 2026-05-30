@@ -65,14 +65,14 @@ Run:
 
 ```sh
 BLOBSTER_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net" \
-  BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azure
+  BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azureblob
 ```
 
 Optional:
 
 ```sh
 BLOBSTER_AZURE_PREFIX=blobster/manual/ \
-  BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azure
+  BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azureblob
 ```
 
 The test builds a `*container.Client` from the connection string via

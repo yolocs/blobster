@@ -1,6 +1,6 @@
 //go:build cloud
 
-package azure_test
+package azureblob_test
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/yolocs/blobster"
-	"github.com/yolocs/blobster/azure"
+	"github.com/yolocs/blobster/azureblob"
 	"github.com/yolocs/blobster/blobtest"
 )
 
@@ -41,7 +41,7 @@ func TestCloudBucket(t *testing.T) {
 
 	blobtest.TestBucket(t, func(t *testing.T) blobster.Bucket {
 		t.Helper()
-		return azure.New(client, azure.WithPrefix(prefix))
+		return azureblob.New(client, azureblob.WithPrefix(prefix))
 	})
 }
 

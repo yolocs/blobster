@@ -1,10 +1,10 @@
-// Package azure implements a blobster.Bucket backed by Azure Blob Storage. It is
+// Package azureblob implements a blobster.Bucket backed by Azure Blob Storage. It is
 // built from a caller-owned *container.Client (blobster never reads ambient
 // Azure configuration and never closes the client); a container is the bucket.
 // Conditional writes use Azure's If-None-Match/If-Match ETag conditions; streamed
 // writes go through the block-blob upload-stream API over an io.Pipe; server-side
 // copy uses the asynchronous Copy Blob operation polled to completion.
-package azure
+package azureblob
 
 import (
 	"bytes"

@@ -9,7 +9,7 @@ GitHub issues.
 
 This describes both the implemented foundation and the **target** architecture.
 The base `Bucket` API, shared conformance tests, and the `mem`, `file`, `gcs`,
-`s3`, and `azure` drivers are implemented. The higher-level utilities are
+`s3`, and `azureblob` drivers are implemented. The higher-level utilities are
 planned. The **backend API facts** the design depends on —
 conditional writes, cross-region copy, multipart — are verified against the
 providers' docs and Go SDKs; the evidence and exact API surfaces live in
@@ -155,7 +155,7 @@ Mapping per backend:
 |--------|---------------|--------------------------|
 | `s3`    | `If-None-Match: *` on PUT | `If-Match` / `If-None-Match` on the conditional write |
 | `gcs`   | `storage.Conditions{DoesNotExist: true}` | `GenerationMatch` / `GenerationNotMatch` |
-| `azure` | `If-None-Match: *` | `If-Match` / `If-None-Match` (ETag) |
+| `azureblob` | `If-None-Match: *` | `If-Match` / `If-None-Match` (ETag) |
 | `mem`   | in-process compare under a lock | version compare under a lock |
 | `file`  | absence check + atomic rename, under a per-bucket lock | sidecar version-token compare + atomic rename, under a per-bucket lock |
 
@@ -204,7 +204,7 @@ type assertion per capability.
 
 ### Capability matrix (target)
 
-| Capability         | `mem` | `file` | `s3` | `gcs` | `azure` |
+| Capability         | `mem` | `file` | `s3` | `gcs` | `azureblob` |
 |--------------------|:-----:|:------:|:----:|:-----:|:-------:|
 | Base `Bucket`      |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `ConditionalWrites`|  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
@@ -219,8 +219,8 @@ is no "region" to cross, but the interface is satisfied for uniform testing.
 ³ requires `gcs.WithSignedURLs`.
 
 Implemented today: base `Bucket`, conditional writes, copy, list/list-page,
-range reads for `mem`, `file`, `gcs`, `s3`, and `azure`; signed URLs for `gcs`
-(with `WithSignedURLs`), `s3`, and `azure`. Multipart, cross-region copy, and
+range reads for `mem`, `file`, `gcs`, `s3`, and `azureblob`; signed URLs for `gcs`
+(with `WithSignedURLs`), `s3`, and `azureblob`. Multipart, cross-region copy, and
 pinger are planned.
 
 The `s3` driver wraps a caller-owned `*s3.Client` (`s3.New(client, bucket,
@@ -247,7 +247,7 @@ version token and create/mod time, matching `mem`/`gcs`/`s3` (and diverging from
 `gocloud.dev/blob/fileblob`, which preserves the source's metadata) so every
 object carries its own identity.
 
-The `azure` driver wraps a caller-owned `*container.Client` (`azure.New(client,
+The `azureblob` driver wraps a caller-owned `*container.Client` (`azureblob.New(client,
 ...)`) — an Azure container is the unit that maps to a blobster bucket, so the
 container client carries both the account endpoint and the container name, and
 no separate name argument is needed. Conditional writes map to
@@ -270,7 +270,7 @@ credential.
 
 The shared `blobtest` conformance suite defines the base bucket contract. The
 default test run exercises it against `mem` and `file` (real implementations,
-the latter via `t.TempDir()`) and against fake-backed `gcs`/`s3`/`azure` wrappers
+the latter via `t.TempDir()`) and against fake-backed `gcs`/`s3`/`azureblob` wrappers
 (mem-backed) that verify the prefix/list/precondition plumbing without a network.
 The cloud drivers' real backends run the same suite behind the `cloud` build
 tag:
@@ -278,7 +278,7 @@ tag:
 ```sh
 BLOBSTER_GCS_BUCKET=my-test-bucket go test -tags cloud ./gcs
 BLOBSTER_S3_BUCKET=my-test-bucket  go test -tags cloud ./s3
-BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azure
+BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azureblob
 ```
 
 GCS uses standard Google Application Default Credentials; S3 uses the standard
@@ -414,7 +414,7 @@ mem/                 ← in-memory driver (reference implementation + test subst
 file/                ← filesystem driver (local integration + small deployments)
 s3/                  ← AWS S3 driver (wraps a caller-owned *s3.Client)
 gcs/                 ← Google Cloud Storage driver (wraps *storage.Client)
-azure/               ← Azure Blob driver (wraps the container/service client)
+azureblob/           ← Azure Blob driver (wraps the container client)
 internal/            ← shared etag/condition plumbing, not part of the public API
 docs/
   architecture.md    ← this document
@@ -434,7 +434,7 @@ README.md  LICENSE  go.mod  Makefile
         blobster (root: interfaces + types)
               ▲                           ▲
               │                           │
-   mem/ file/ s3/ gcs/ azure/  (drivers: implement root interfaces; import only root)
+   mem/ file/ s3/ gcs/ azureblob/  (drivers: implement root interfaces; import only root)
 ```
 
 - Drivers import **only** the root `blobster` package (and their native SDK).

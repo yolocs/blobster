@@ -19,7 +19,7 @@ Implemented:
 - `gcs` driver built from a caller-owned `*storage.Client`
 - `s3` driver built from a caller-owned `*s3.Client` (conditional
   writes, streaming multipart uploads, server-side copy, presigned URLs)
-- `azure` driver built from a caller-owned `*container.Client` (conditional
+- `azureblob` driver built from a caller-owned `*container.Client` (conditional
   writes, streaming block-blob uploads, async server-side copy, SAS URLs)
 - shared conformance tests plus GCS, S3, and Azure cloud tests behind the
   `cloud` build tag
