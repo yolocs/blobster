@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/google/go-cmp/cmp"
 	"github.com/yolocs/blobster"
 	"github.com/yolocs/blobster/blobtest"
@@ -299,4 +300,97 @@ func preconditionsToList(preconditions blobster.Preconditions) []blobster.Precon
 		out = append(out, blobster.IfNotMatch(preconditions.IfNotMatch))
 	}
 	return out
+}
+
+func TestEscapeKeyRoundTrip(t *testing.T) {
+	t.Parallel()
+	keys := []string{
+		"plain/key.txt",
+		"a/nested/object",
+		`with\backslash`,
+		"has space",
+		`quote"hash#pct%question?`,
+		"ctrl\x01char",
+		"unicode/ümlaut/key",
+		"trailing/",
+		"../escape",
+		"a/../b",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			escaped := escapeKey(key, false)
+			// Escaped full keys must avoid the characters Azure cannot address.
+			for i, r := range []rune(escaped) {
+				if r == '\\' || r == '"' || r == '#' || r == '%' || r == '?' || r < 32 || r == 127 {
+					t.Fatalf("escaped %q still contains forbidden rune %q at %d", escaped, r, i)
+				}
+			}
+			if got := unescapeKey(escaped); got != key {
+				t.Fatalf("round trip: unescapeKey(escapeKey(%q)) = %q", key, got)
+			}
+		})
+	}
+}
+
+func TestEscapeKeyTrailingSlash(t *testing.T) {
+	t.Parallel()
+	// A trailing slash is escaped for full keys but left intact for prefixes.
+	if got := escapeKey("dir/", false); got == "dir/" || unescapeKey(got) != "dir/" {
+		t.Fatalf("escapeKey(\"dir/\", false) = %q, want escaped form round-tripping to dir/", got)
+	}
+	if got := escapeKey("dir/", true); got != "dir/" {
+		t.Fatalf("escapeKey(\"dir/\", true) = %q, want dir/ unchanged", got)
+	}
+}
+
+func TestMetadataRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := map[string]string{
+		"owner":    "tests",
+		"my-tag":   "value with spaces",
+		"trace_id": "ümlaut/value",
+	}
+	az, err := toAzureMetadata(in)
+	if err != nil {
+		t.Fatalf("toAzureMetadata: %v", err)
+	}
+	// Azure metadata names must be C# identifiers: no characters outside [A-Za-z0-9_].
+	for k := range az {
+		for _, r := range k {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') {
+				t.Fatalf("escaped metadata key %q contains invalid rune %q", k, r)
+			}
+		}
+	}
+	got := fromAzureMetadata(az)
+	if diff := cmp.Diff(in, got); diff != "" {
+		t.Fatalf("metadata round trip mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestMetadataDuplicateAfterEscaping(t *testing.T) {
+	t.Parallel()
+	// "a.b" escapes to "a__0x2e__b", colliding with a literal "a__0x2e__b"; the
+	// collision must be rejected rather than silently dropping a value.
+	_, err := toAzureMetadata(map[string]string{"a.b": "1", "a__0x2e__b": "2"})
+	if !errors.Is(err, blobster.ErrInvalidOption) {
+		t.Fatalf("duplicate-after-escaping error = %v, want ErrInvalidOption", err)
+	}
+}
+
+func TestSignedURLRejectsContentType(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	client, err := container.NewClientWithNoCredential("https://acct.blob.core.windows.net/cont", nil)
+	if err != nil {
+		t.Fatalf("NewClientWithNoCredential: %v", err)
+	}
+	backend := &azureBackend{client: client}
+	if _, err := backend.SignedURL(ctx, "k", &blobster.SignedURLOptions{ContentType: "text/plain"}); !errors.Is(err, blobster.ErrUnsupported) {
+		t.Fatalf("SignedURL with ContentType error = %v, want ErrUnsupported", err)
+	}
+	if _, err := backend.SignedURL(ctx, "k", &blobster.SignedURLOptions{EnforceAbsentContentType: true}); !errors.Is(err, blobster.ErrUnsupported) {
+		t.Fatalf("SignedURL with EnforceAbsentContentType error = %v, want ErrUnsupported", err)
+	}
 }

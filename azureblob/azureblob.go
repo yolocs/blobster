@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -248,7 +249,7 @@ func (b *azureBackend) As(i any) bool {
 }
 
 func (b *azureBackend) Attributes(ctx context.Context, key string) (*blobster.Attributes, error) {
-	resp, err := b.client.NewBlobClient(key).GetProperties(ctx, nil)
+	resp, err := b.client.NewBlobClient(escapeKey(key, false)).GetProperties(ctx, nil)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -269,7 +270,7 @@ func (b *azureBackend) Attributes(ctx context.Context, key string) (*blobster.At
 }
 
 func (b *azureBackend) NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error) {
-	client := b.client.NewBlobClient(key)
+	client := b.client.NewBlobClient(escapeKey(key, false))
 	if opts != nil && opts.BeforeRead != nil {
 		input := &blob.DownloadStreamOptions{}
 		if err := opts.BeforeRead(func(i any) bool { return blobster.AssignNative(input, i) }); err != nil {
@@ -314,7 +315,7 @@ func newOpenReader(client *blob.Client) func(context.Context, string, int64, int
 }
 
 func (b *azureBackend) NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error) {
-	client := b.client.NewBlockBlobClient(key)
+	client := b.client.NewBlockBlobClient(escapeKey(key, false))
 	headers := &blob.HTTPHeaders{}
 	if opts.CacheControl != "" {
 		headers.BlobCacheControl = &opts.CacheControl
@@ -331,11 +332,15 @@ func (b *azureBackend) NewWriter(ctx context.Context, key string, opts *blobster
 	if opts.ContentType != "" {
 		headers.BlobContentType = &opts.ContentType
 	}
+	md, err := toAzureMetadata(opts.Metadata)
+	if err != nil {
+		return nil, err
+	}
 	w := &azureWriter{
 		ctx:      ctx,
 		client:   client,
 		headers:  headers,
-		metadata: toAzureMetadata(opts.Metadata),
+		metadata: md,
 		conds:    modifiedConditions(preconditions),
 		before:   opts.BeforeWrite,
 	}
@@ -355,15 +360,15 @@ func (b *azureBackend) NewWriter(ctx context.Context, key string, opts *blobster
 
 func (b *azureBackend) Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error {
 	opts := &blob.DeleteOptions{AccessConditions: modifiedConditions(preconditions)}
-	if _, err := b.client.NewBlobClient(key).Delete(ctx, opts); err != nil {
+	if _, err := b.client.NewBlobClient(escapeKey(key, false)).Delete(ctx, opts); err != nil {
 		return mapError(err)
 	}
 	return nil
 }
 
 func (b *azureBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
-	dst := b.client.NewBlobClient(dstKey)
-	srcURL := b.client.NewBlobClient(srcKey).URL()
+	dst := b.client.NewBlobClient(escapeKey(dstKey, false))
+	srcURL := b.client.NewBlobClient(escapeKey(srcKey, false)).URL()
 	input := &blob.StartCopyFromURLOptions{}
 	if opts != nil && opts.BeforeCopy != nil {
 		if err := opts.BeforeCopy(func(i any) bool { return blobster.AssignNative(input, i) }); err != nil {
@@ -380,23 +385,45 @@ func (b *azureBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *bl
 	if deref(resp.CopyStatus) == blob.CopyStatusTypeSuccess {
 		return nil
 	}
+	// A GetProperties failure mid-copy may be transient, so tolerate a few before
+	// giving up; bail immediately if the context is done.
+	const maxPollErrors = 3
+	pollErrors := 0
 	for {
 		props, err := dst.GetProperties(ctx, nil)
 		if err != nil {
-			return mapError(err)
+			pollErrors++
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if pollErrors >= maxPollErrors {
+				return mapError(err)
+			}
+			if waitErr := sleep(ctx, b.copyInterval); waitErr != nil {
+				return waitErr
+			}
+			continue
 		}
+		pollErrors = 0
 		switch deref(props.CopyStatus) {
 		case blob.CopyStatusTypeSuccess:
 			return nil
 		case blob.CopyStatusTypePending:
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(b.copyInterval):
+			if waitErr := sleep(ctx, b.copyInterval); waitErr != nil {
+				return waitErr
 			}
 		default:
 			return fmt.Errorf("blobster azure: copy %s: status %q", deref(resp.CopyID), deref(props.CopyStatus))
 		}
+	}
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
 	}
 }
 
@@ -415,18 +442,19 @@ func (b *azureBackend) ListPage(ctx context.Context, pageToken []byte, pageSize 
 		marker = ptr(string(pageToken))
 	}
 	maxResults := int32(pageSize)
+	escapedPrefix := escapeKey(opts.Prefix, true)
 
 	if opts.Delimiter != "" {
 		listOpts := &container.ListBlobsHierarchyOptions{Marker: marker, MaxResults: &maxResults}
-		if opts.Prefix != "" {
-			listOpts.Prefix = &opts.Prefix
+		if escapedPrefix != "" {
+			listOpts.Prefix = &escapedPrefix
 		}
 		if opts.BeforeList != nil {
 			if err := opts.BeforeList(func(i any) bool { return blobster.AssignNative(listOpts, i) }); err != nil {
 				return nil, nil, err
 			}
 		}
-		pager := b.client.NewListBlobsHierarchyPager(opts.Delimiter, listOpts)
+		pager := b.client.NewListBlobsHierarchyPager(escapeKey(opts.Delimiter, true), listOpts)
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, nil, mapError(err)
@@ -435,7 +463,7 @@ func (b *azureBackend) ListPage(ctx context.Context, pageToken []byte, pageSize 
 		page := make([]*blobster.ListObject, 0, len(seg.BlobItems)+len(seg.BlobPrefixes))
 		for _, prefix := range seg.BlobPrefixes {
 			page = append(page, &blobster.ListObject{
-				Key:    deref(prefix.Name),
+				Key:    unescapeKey(deref(prefix.Name)),
 				IsDir:  true,
 				Native: prefix,
 			})
@@ -447,8 +475,8 @@ func (b *azureBackend) ListPage(ctx context.Context, pageToken []byte, pageSize 
 	}
 
 	listOpts := &container.ListBlobsFlatOptions{Marker: marker, MaxResults: &maxResults}
-	if opts.Prefix != "" {
-		listOpts.Prefix = &opts.Prefix
+	if escapedPrefix != "" {
+		listOpts.Prefix = &escapedPrefix
 	}
 	if opts.BeforeList != nil {
 		if err := opts.BeforeList(func(i any) bool { return blobster.AssignNative(listOpts, i) }); err != nil {
@@ -485,6 +513,12 @@ func (b *azureBackend) SignedURL(ctx context.Context, key string, opts *blobster
 	if opts == nil {
 		opts = &blobster.SignedURLOptions{}
 	}
+	// GetSASURL signs only the blob path, permissions, and expiry; it cannot bind
+	// a Content-Type to the request, so refuse rather than silently ignore the
+	// caller's content-type enforcement.
+	if opts.ContentType != "" || opts.EnforceAbsentContentType {
+		return "", fmt.Errorf("%w: azureblob SAS URLs cannot enforce Content-Type", blobster.ErrUnsupported)
+	}
 	expiry := opts.Expiry
 	if expiry == 0 {
 		expiry = blobster.DefaultSignedURLExpiry
@@ -497,7 +531,7 @@ func (b *azureBackend) SignedURL(ctx context.Context, key string, opts *blobster
 	if err != nil {
 		return "", err
 	}
-	signed, err := b.client.NewBlobClient(key).GetSASURL(perms, time.Now().Add(expiry), nil)
+	signed, err := b.client.NewBlobClient(escapeKey(key, false)).GetSASURL(perms, time.Now().Add(expiry), nil)
 	if err != nil {
 		return "", mapError(err)
 	}
@@ -550,7 +584,7 @@ func modifiedConditions(preconditions blobster.Preconditions) *blob.AccessCondit
 
 func blobItemToObject(item *container.BlobItem) *blobster.ListObject {
 	obj := &blobster.ListObject{
-		Key:    deref(item.Name),
+		Key:    unescapeKey(deref(item.Name)),
 		Native: item,
 	}
 	if props := item.Properties; props != nil {
@@ -868,15 +902,24 @@ func nextMarker(marker *string) []byte {
 	return []byte(*marker)
 }
 
-func toAzureMetadata(metadata map[string]string) map[string]*string {
+// toAzureMetadata escapes metadata for Azure, which only accepts C# identifiers
+// as metadata names and ASCII header values. Keys are hex-escaped to valid
+// identifiers and values are URL-escaped; fromAzureMetadata reverses both. This
+// mirrors gocloud.dev/blob/azureblob so metadata round-trips between the two.
+func toAzureMetadata(metadata map[string]string) (map[string]*string, error) {
 	if len(metadata) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make(map[string]*string, len(metadata))
 	for k, v := range metadata {
-		out[k] = ptr(v)
+		ek := escapeMetadataKey(k)
+		if _, dup := out[ek]; dup {
+			return nil, fmt.Errorf("%w: duplicate metadata key after escaping: %q", blobster.ErrInvalidOption, k)
+		}
+		ev := url.QueryEscape(v)
+		out[ek] = &ev
 	}
-	return out
+	return out, nil
 }
 
 func fromAzureMetadata(metadata map[string]*string) map[string]string {
@@ -885,9 +928,116 @@ func fromAzureMetadata(metadata map[string]*string) map[string]string {
 	}
 	out := make(map[string]string, len(metadata))
 	for k, v := range metadata {
-		out[strings.ToLower(k)] = deref(v)
+		value := deref(v)
+		if unescaped, err := url.QueryUnescape(value); err == nil {
+			value = unescaped
+		}
+		out[strings.ToLower(unescapeKey(k))] = value
 	}
 	return out
+}
+
+func escapeMetadataKey(key string) string {
+	return hexEscape(key, func(r []rune, i int) bool {
+		c := r[i]
+		switch {
+		case i == 0 && c >= '0' && c <= '9':
+			return true
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_':
+			return false
+		}
+		return true
+	})
+}
+
+// escapeKey hex-escapes the characters Azure Blob cannot address consistently,
+// using the "__0x<hex>__" scheme of gocloud.dev/blob/azureblob so blob names
+// round-trip between the two drivers. unescapeKey reverses it. isPrefix skips the
+// trailing-slash rules that only matter for full object keys.
+func escapeKey(key string, isPrefix bool) string {
+	return hexEscape(key, func(r []rune, i int) bool {
+		c := r[i]
+		switch {
+		// Azure does not handle backslashes in blob names well.
+		case c == '\\':
+			return true
+		// Characters Azure cannot address consistently (control chars, " # % ? DEL).
+		case c < 32 || c == '"' || c == '#' || c == '%' || c == '?' || c == 127:
+			return true
+		// A trailing "/" on a full key is not addressable; escape it.
+		case !isPrefix && i == len(r)-1 && c == '/':
+			return true
+		// Escape the trailing slash in "../".
+		case i > 1 && r[i] == '/' && r[i-1] == '.' && r[i-2] == '.':
+			return true
+		}
+		return false
+	})
+}
+
+func unescapeKey(key string) string {
+	return hexUnescape(key)
+}
+
+func hexEscape(s string, shouldEscape func(r []rune, i int) bool) string {
+	rs := []rune(s)
+	escape := false
+	for i := range rs {
+		if shouldEscape(rs, i) {
+			escape = true
+			break
+		}
+	}
+	if !escape {
+		return s
+	}
+	var b strings.Builder
+	for i := range rs {
+		if shouldEscape(rs, i) {
+			fmt.Fprintf(&b, "__0x%x__", rs[i])
+		} else {
+			b.WriteRune(rs[i])
+		}
+	}
+	return b.String()
+}
+
+func hexUnescape(s string) string {
+	if !strings.Contains(s, "__0x") {
+		return s
+	}
+	rs := []rune(s)
+	var b strings.Builder
+	for i := 0; i < len(rs); {
+		if c, n, ok := unescapeRune(rs, i); ok {
+			b.WriteRune(c)
+			i += n
+			continue
+		}
+		b.WriteRune(rs[i])
+		i++
+	}
+	return b.String()
+}
+
+// unescapeRune decodes a "__0x<hex>__" sequence at rs[i], returning the decoded
+// rune and the number of runes consumed.
+func unescapeRune(rs []rune, i int) (rune, int, bool) {
+	if i+4 >= len(rs) || rs[i] != '_' || rs[i+1] != '_' || rs[i+2] != '0' || rs[i+3] != 'x' {
+		return 0, 0, false
+	}
+	j := i + 4
+	for j < len(rs) && rs[j] != '_' {
+		j++
+	}
+	if j == i+4 || j+1 >= len(rs) || rs[j] != '_' || rs[j+1] != '_' {
+		return 0, 0, false
+	}
+	v, err := strconv.ParseInt(string(rs[i+4:j]), 16, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	return rune(v), (j + 2) - i, true
 }
 
 func mapError(err error) error {

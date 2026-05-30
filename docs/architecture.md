@@ -262,9 +262,22 @@ across blocks, so unvalidated writes stay streaming and never buffer the whole
 blob while validated writes buffer. `Copy` is `Copy Blob`, which is
 asynchronous: the driver starts the copy and polls the destination's copy
 status to completion so the base synchronous `Copy` contract holds (same-account
-copies typically complete on the first poll). Signed URLs use the blob client's
-`GetSASURL`, which requires the container client to carry a shared-key
-credential.
+copies typically complete on the first poll; a few transient `GetProperties`
+failures during polling are tolerated before giving up). Signed URLs use the
+blob client's `GetSASURL`, which requires the container client to carry a
+shared-key credential; because `GetSASURL` signs only the path, permissions, and
+expiry, the driver returns `ErrUnsupported` when a signed URL is asked to enforce
+a Content-Type rather than silently dropping it.
+
+Unlike the other drivers, `azureblob` **escapes keys and metadata** at the
+backend boundary, because Azure cannot address some characters and only accepts
+C# identifiers as metadata names. Blob keys hex-escape control characters,
+`"`, `#`, `%`, `?`, `\`, a trailing `/`, and the slash in `../` to
+`__0x<hex>__`; metadata keys hex-escape to valid identifiers and metadata values
+are URL-escaped. The scheme matches `gocloud.dev/blob/azureblob` so blobs and
+metadata round-trip between the two, and listing reverses it so callers always
+see their original keys. (`s3`/`gcs` pass keys through unescaped — Azure is the
+strict outlier.)
 
 ## Testing
 
