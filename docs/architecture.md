@@ -231,6 +231,42 @@ a server-side `CopyObject` (the base `Copy` is unconditional on every backend).
 Conditional delete uses `If-Match` (the only destination condition DeleteObject
 accepts).
 
+### S3-compatible backends (Cloudflare R2)
+
+R2 speaks the S3 API, so it needs **no driver of its own**. Per invariant 2 the
+`s3` driver is built from a caller-owned `*s3.Client`; the caller points that
+client at R2's endpoint (`https://<account-id>.r2.cloudflarestorage.com`, region
+`auto`) and uses `s3.New` unchanged. A separate `r2` package would only re-wrap
+the same client and duplicate `s3`, so blobster deliberately does not ship one —
+the work is configuring the client correctly and knowing which capabilities R2
+honors, both verified by `TestCloudBucketR2` in `s3/s3_cloud_test.go`.
+
+- **The SDK checksum default must be turned off.** Recent `aws-sdk-go-v2`
+  releases compute a CRC32 request checksum by default; R2 rejects it (`Header
+  'x-amz-checksum-algorithm' with value 'CRC32' not implemented`) and every
+  `PutObject`/`UploadPart` fails. Build the client with
+  `RequestChecksumCalculation` and `ResponseChecksumValidation` set to
+  *when-required*. This is the caller's job (invariant 2 keeps blobster out of
+  client config), but without it nothing writes.
+- **Conditional writes hold.** R2 honors `If-None-Match: *` (create-only) and
+  `If-Match`/`If-None-Match` on `PutObject`/`CopyObject`, returning 412, so the
+  `ConditionalWrites` capability is real and the lock's acquire / renew / takeover
+  path works unchanged.
+- **Conditional delete is the one gap.** R2 does not document `If-Match` on
+  `DeleteObject` (S3 itself only gained it in 2025-09). The `s3` driver's
+  conditional `Delete` therefore cannot be relied on against R2, so the lock's
+  *safe release* (delete-only-if-still-mine) loses its guarantee there; the lock
+  still functions via lease expiry/takeover, but a holder cannot prove it deleted
+  only its own record. `Capabilities()` cannot reflect this — the driver does not
+  know it is talking to R2 — so a caller needing the release guarantee must gate on
+  the backend, not on the descriptor. The conformance suite's conditional-delete
+  case is what surfaces the actual R2 behavior.
+- **There is no real cross-region copy.** R2 has no S3-style regions (it is
+  global, with optional jurisdictions), so `CopyObject` works intra-bucket but
+  there is no region to cross.
+- **Multipart and signed URLs hold.** R2 implements native S3 multipart and SigV4
+  presigning.
+
 The `file` driver splits storage into three sibling subtrees under the bucket
 root — `data/<key>` for object bytes, `meta/<key>` for a JSON sidecar (content
 headers, user metadata, MD5, size, opaque version token), and `tmp/` for
@@ -292,6 +328,10 @@ tag:
 BLOBSTER_GCS_BUCKET=my-test-bucket go test -tags cloud ./gcs
 BLOBSTER_S3_BUCKET=my-test-bucket  go test -tags cloud ./s3
 BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azureblob
+
+# R2 reuses the s3 driver against R2's endpoint (S3-compatible, no separate driver):
+BLOBSTER_R2_BUCKET=my-bucket BLOBSTER_R2_ENDPOINT=https://<acct>.r2.cloudflarestorage.com \
+  BLOBSTER_R2_ACCESS_KEY_ID=... BLOBSTER_R2_SECRET_ACCESS_KEY=... go test -tags cloud ./s3
 ```
 
 GCS uses standard Google Application Default Credentials; S3 uses the standard

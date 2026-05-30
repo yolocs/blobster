@@ -59,6 +59,37 @@ Conditional writes require S3's recent support: `If-None-Match` (create-only, GA
 (conditional delete, GA 2025-09). Test against a general-purpose bucket in a
 region where these are available.
 
+## R2 (Cloudflare)
+
+R2 is S3-compatible and reuses the `s3` driver, so its cloud test lives in the
+same package (`TestCloudBucketR2`). Run:
+
+```sh
+BLOBSTER_R2_BUCKET=my-bucket \
+  BLOBSTER_R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com \
+  BLOBSTER_R2_ACCESS_KEY_ID=... BLOBSTER_R2_SECRET_ACCESS_KEY=... \
+  go test -tags cloud -run TestCloudBucketR2 ./s3
+```
+
+Optional `BLOBSTER_R2_PREFIX=blobster/manual/` forces all test objects under a
+chosen prefix. Unlike the AWS test, the R2 test takes credentials explicitly
+(R2 access key id + secret) and sets `BaseEndpoint`, region `auto`, and the
+checksum config below, rather than relying on the ambient AWS chain.
+
+The test configures the client with `RequestChecksumCalculation` and
+`ResponseChecksumValidation` set to *when-required*. This is mandatory:
+`aws-sdk-go-v2` otherwise sends a CRC32 request checksum that R2 rejects
+(`Header 'x-amz-checksum-algorithm' with value 'CRC32' not implemented`), failing
+every write. Application code building an R2-backed `s3.Bucket` must set the same
+options on its client.
+
+R2 honors conditional writes (`If-None-Match`/`If-Match` on PUT and COPY) but does
+**not** document `If-Match` on DeleteObject, so the conditional-delete part of the
+conformance suite is the empirical check for whether the lock's safe-release
+guarantee holds on R2 — expect that case to surface the gap. R2 also has no
+S3-style regions, so there is no cross-region copy to exercise. The credential
+needs permission to head the bucket and to list/create/read/copy/delete objects.
+
 ## Azure
 
 Run:
