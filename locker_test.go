@@ -1,4 +1,4 @@
-package lock_test
+package blobster_test
 
 import (
 	"context"
@@ -10,61 +10,60 @@ import (
 
 	"github.com/yolocs/blobster"
 	"github.com/yolocs/blobster/file"
-	"github.com/yolocs/blobster/lock"
 	"github.com/yolocs/blobster/mem"
 )
 
-// backendFactory builds a fresh backend plus the underlying bucket, so tests can
-// also poke the record out of band to simulate takeovers.
-type backendFactory struct {
+// lockBackendFactory builds a fresh lock backend plus the underlying bucket, so
+// tests can also poke the record out of band to simulate takeovers.
+type lockBackendFactory struct {
 	name string
-	make func(t *testing.T) (lock.Backend, blobster.Bucket)
+	make func(t *testing.T) (blobster.LockBackend, blobster.Bucket)
 }
 
-func backends() []backendFactory {
-	return []backendFactory{
+func lockBackends() []lockBackendFactory {
+	return []lockBackendFactory{
 		{
 			name: "mem",
-			make: func(t *testing.T) (lock.Backend, blobster.Bucket) {
+			make: func(t *testing.T) (blobster.LockBackend, blobster.Bucket) {
 				b := mem.New()
-				return lock.FromBucket(b), b
+				return blobster.LockBackendFromBucket(b), b
 			},
 		},
 		{
 			name: "file",
-			make: func(t *testing.T) (lock.Backend, blobster.Bucket) {
+			make: func(t *testing.T) (blobster.LockBackend, blobster.Bucket) {
 				b := file.New(t.TempDir())
-				return lock.FromBucket(b), b
+				return blobster.LockBackendFromBucket(b), b
 			},
 		},
 	}
 }
 
-// fakeClock is a manually advanced clock for deterministic lease/expiry tests.
-type fakeClock struct {
+// lockClock is a manually advanced clock for deterministic lease/expiry tests.
+type lockClock struct {
 	mu sync.Mutex
 	t  time.Time
 }
 
-func newFakeClock() *fakeClock {
-	return &fakeClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+func newLockClock() *lockClock {
+	return &lockClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 }
 
-func (c *fakeClock) Now() time.Time {
+func (c *lockClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.t
 }
 
-func (c *fakeClock) Advance(d time.Duration) {
+func (c *lockClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.t = c.t.Add(d)
 }
 
-func eachBackend(t *testing.T, fn func(t *testing.T, f backendFactory)) {
+func eachLockBackend(t *testing.T, fn func(t *testing.T, f lockBackendFactory)) {
 	t.Helper()
-	for _, f := range backends() {
+	for _, f := range lockBackends() {
 		t.Run(f.name, func(t *testing.T) {
 			t.Parallel()
 			fn(t, f)
@@ -72,12 +71,12 @@ func eachBackend(t *testing.T, fn func(t *testing.T, f backendFactory)) {
 	}
 }
 
-func TestAcquireReleaseReacquire(t *testing.T) {
+func TestLockerAcquireReleaseReacquire(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		l := lock.New(backend)
+		l := blobster.NewLocker(backend)
 
 		held, err := l.TryAcquire(ctx, "job")
 		if err != nil {
@@ -87,7 +86,7 @@ func TestAcquireReleaseReacquire(t *testing.T) {
 			t.Errorf("Key() = %q, want job", held.Key())
 		}
 
-		if _, err := l.TryAcquire(ctx, "job"); !errors.Is(err, lock.ErrLockHeld) {
+		if _, err := l.TryAcquire(ctx, "job"); !errors.Is(err, blobster.ErrLockHeld) {
 			t.Fatalf("second acquire: got %v, want ErrLockHeld", err)
 		}
 
@@ -105,12 +104,12 @@ func TestAcquireReleaseReacquire(t *testing.T) {
 	})
 }
 
-func TestDistinctKeysIndependent(t *testing.T) {
+func TestLockerDistinctKeysIndependent(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		l := lock.New(backend)
+		l := blobster.NewLocker(backend)
 
 		a, err := l.TryAcquire(ctx, "a")
 		if err != nil {
@@ -129,12 +128,12 @@ func TestDistinctKeysIndependent(t *testing.T) {
 	})
 }
 
-func TestConcurrentTryAcquireSingleWinner(t *testing.T) {
+func TestLockerConcurrentTryAcquireSingleWinner(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		l := lock.New(backend)
+		l := blobster.NewLocker(backend)
 
 		const contenders = 16
 		var (
@@ -143,7 +142,7 @@ func TestConcurrentTryAcquireSingleWinner(t *testing.T) {
 			held    atomic.Int64
 			start   = make(chan struct{})
 		)
-		var winner atomic.Pointer[lock.Lock]
+		var winner atomic.Pointer[blobster.Lock]
 		for range contenders {
 			wg.Add(1)
 			go func() {
@@ -154,7 +153,7 @@ func TestConcurrentTryAcquireSingleWinner(t *testing.T) {
 				case err == nil:
 					winners.Add(1)
 					winner.Store(lk)
-				case errors.Is(err, lock.ErrLockHeld):
+				case errors.Is(err, blobster.ErrLockHeld):
 					held.Add(1)
 				default:
 					t.Errorf("unexpected error: %v", err)
@@ -178,33 +177,33 @@ func TestConcurrentTryAcquireSingleWinner(t *testing.T) {
 	})
 }
 
-func TestTakeoverAfterExpiry(t *testing.T) {
+func TestLockerTakeoverAfterExpiry(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		clock := newFakeClock()
+		clock := newLockClock()
 		// Renew interval far in the future so the holder never self-renews; we
 		// drive expiry purely via the clock.
-		l := lock.New(backend,
-			lock.WithClock(clock.Now),
-			lock.WithLeaseDuration(30*time.Second),
-			lock.WithRenewInterval(time.Hour),
+		l := blobster.NewLocker(backend,
+			blobster.WithLockClock(clock.Now),
+			blobster.WithLeaseDuration(30*time.Second),
+			blobster.WithRenewInterval(time.Hour),
 		)
 
-		first, err := l.TryAcquire(ctx, "job", lock.WithOwner("first"))
+		first, err := l.TryAcquire(ctx, "job", blobster.WithOwner("first"))
 		if err != nil {
 			t.Fatalf("first acquire: %v", err)
 		}
 
 		// Still within the lease: takeover must fail.
-		if _, err := l.TryAcquire(ctx, "job", lock.WithOwner("second")); !errors.Is(err, lock.ErrLockHeld) {
+		if _, err := l.TryAcquire(ctx, "job", blobster.WithOwner("second")); !errors.Is(err, blobster.ErrLockHeld) {
 			t.Fatalf("takeover before expiry: got %v, want ErrLockHeld", err)
 		}
 
 		clock.Advance(31 * time.Second)
 
-		second, err := l.TryAcquire(ctx, "job", lock.WithOwner("second"))
+		second, err := l.TryAcquire(ctx, "job", blobster.WithOwner("second"))
 		if err != nil {
 			t.Fatalf("takeover after expiry: %v", err)
 		}
@@ -216,7 +215,7 @@ func TestTakeoverAfterExpiry(t *testing.T) {
 		if err := first.Release(ctx); err != nil {
 			t.Fatalf("displaced release: %v", err)
 		}
-		if _, err := l.TryAcquire(ctx, "job", lock.WithOwner("third")); !errors.Is(err, lock.ErrLockHeld) {
+		if _, err := l.TryAcquire(ctx, "job", blobster.WithOwner("third")); !errors.Is(err, blobster.ErrLockHeld) {
 			t.Fatalf("after displaced release, new holder should still hold: got %v", err)
 		}
 
@@ -226,17 +225,21 @@ func TestTakeoverAfterExpiry(t *testing.T) {
 	})
 }
 
-func TestRenewKeepsLockHeld(t *testing.T) {
+func TestLockerRenewKeepsLockHeld(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		// Real clock with a generous renew-to-lease margin (~12x): the background
-		// renewer must keep the lock alive well past a single lease, with enough
-		// headroom to stay reliable under -race, parallel load, and file fsync.
-		l := lock.New(backend,
-			lock.WithLeaseDuration(600*time.Millisecond),
-			lock.WithRenewInterval(50*time.Millisecond),
+		// Freeze the clock so the lease can never lapse from wall-clock timing:
+		// this isolates "the renewer runs and successfully CASes" from any
+		// expiry race, which is what makes the test deterministic under -race,
+		// parallel load, and file fsync. We prove renewal by observing the
+		// record's version advance while the lock stays held.
+		clock := newLockClock()
+		l := blobster.NewLocker(backend,
+			blobster.WithLockClock(clock.Now),
+			blobster.WithLeaseDuration(30*time.Second),
+			blobster.WithRenewInterval(20*time.Millisecond),
 		)
 
 		held, err := l.TryAcquire(ctx, "job")
@@ -245,29 +248,45 @@ func TestRenewKeepsLockHeld(t *testing.T) {
 		}
 		defer held.Release(ctx)
 
-		// Span well beyond a single lease so a missing renewer would be caught.
-		deadline := time.Now().Add(900 * time.Millisecond)
+		path := blobster.DefaultLockPrefix + "job"
+		_, v0, err := backend.Get(ctx, path)
+		if err != nil {
+			t.Fatalf("read initial version: %v", err)
+		}
+
+		// Wait (generously) for at least one background renew to land, asserting
+		// the lock stays held and unlost throughout.
+		deadline := time.Now().Add(2 * time.Second)
+		renewed := false
 		for time.Now().Before(deadline) {
-			if _, err := l.TryAcquire(ctx, "job"); !errors.Is(err, lock.ErrLockHeld) {
-				t.Fatalf("lock not held during renew window: got %v", err)
-			}
 			select {
 			case <-held.Done():
 				t.Fatalf("lock unexpectedly lost: %v", held.Err())
-			case <-time.After(40 * time.Millisecond):
+			default:
 			}
+			if _, err := l.TryAcquire(ctx, "job"); !errors.Is(err, blobster.ErrLockHeld) {
+				t.Fatalf("lock not held during renew window: got %v", err)
+			}
+			if _, v, err := backend.Get(ctx, path); err == nil && v != v0 {
+				renewed = true
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !renewed {
+			t.Fatal("background renewer did not extend the lease")
 		}
 	})
 }
 
-func TestLostNotification(t *testing.T) {
+func TestLockerLostNotification(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, bucket := f.make(t)
-		l := lock.New(backend,
-			lock.WithLeaseDuration(60*time.Millisecond),
-			lock.WithRenewInterval(15*time.Millisecond),
+		l := blobster.NewLocker(backend,
+			blobster.WithLeaseDuration(60*time.Millisecond),
+			blobster.WithRenewInterval(15*time.Millisecond),
 		)
 
 		held, err := l.TryAcquire(ctx, "job")
@@ -278,14 +297,14 @@ func TestLostNotification(t *testing.T) {
 
 		// Forcibly overwrite the record out of band, bumping its version so the
 		// holder's next renew CAS fails — a stand-in for a successful takeover.
-		path := lock.DefaultPrefix + "job"
+		path := blobster.DefaultLockPrefix + "job"
 		if err := bucket.WriteAll(ctx, path, []byte("x"), &blobster.WriterOptions{DisableContentTypeDetection: true}); err != nil {
 			t.Fatalf("out-of-band overwrite: %v", err)
 		}
 
 		select {
 		case <-held.Done():
-			if !errors.Is(held.Err(), lock.ErrLockLost) {
+			if !errors.Is(held.Err(), blobster.ErrLockLost) {
 				t.Fatalf("Err() = %v, want ErrLockLost", held.Err())
 			}
 		case <-time.After(2 * time.Second):
@@ -294,15 +313,15 @@ func TestLostNotification(t *testing.T) {
 	})
 }
 
-func TestAcquireBlocksUntilReleased(t *testing.T) {
+func TestLockerAcquireBlocksUntilReleased(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		l := lock.New(backend,
-			lock.WithLeaseDuration(time.Second),
-			lock.WithRenewInterval(time.Hour),
-			lock.WithRetryInterval(10*time.Millisecond),
+		l := blobster.NewLocker(backend,
+			blobster.WithLeaseDuration(time.Second),
+			blobster.WithRenewInterval(time.Hour),
+			blobster.WithRetryInterval(10*time.Millisecond),
 		)
 
 		first, err := l.TryAcquire(ctx, "job")
@@ -310,7 +329,7 @@ func TestAcquireBlocksUntilReleased(t *testing.T) {
 			t.Fatalf("acquire: %v", err)
 		}
 
-		acquired := make(chan *lock.Lock, 1)
+		acquired := make(chan *blobster.Lock, 1)
 		go func() {
 			lk, err := l.Acquire(ctx, "job")
 			if err != nil {
@@ -345,13 +364,13 @@ func TestAcquireBlocksUntilReleased(t *testing.T) {
 	})
 }
 
-func TestAcquireRespectsContextCancel(t *testing.T) {
+func TestLockerAcquireRespectsContextCancel(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		backend, _ := f.make(t)
-		l := lock.New(backend,
-			lock.WithRenewInterval(time.Hour),
-			lock.WithRetryInterval(10*time.Millisecond),
+		l := blobster.NewLocker(backend,
+			blobster.WithRenewInterval(time.Hour),
+			blobster.WithRetryInterval(10*time.Millisecond),
 		)
 
 		held, err := l.TryAcquire(t.Context(), "job")
@@ -368,12 +387,12 @@ func TestAcquireRespectsContextCancel(t *testing.T) {
 	})
 }
 
-func TestWithPrefix(t *testing.T) {
+func TestLockerWithLockPrefix(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, bucket := f.make(t)
-		l := lock.New(backend, lock.WithPrefix("custom/locks"))
+		l := blobster.NewLocker(backend, blobster.WithLockPrefix("custom/locks"))
 
 		held, err := l.TryAcquire(ctx, "job")
 		if err != nil {
@@ -384,33 +403,33 @@ func TestWithPrefix(t *testing.T) {
 		if ok, err := bucket.Exists(ctx, "custom/locks/job"); err != nil || !ok {
 			t.Fatalf("record at custom prefix: exists=%v err=%v", ok, err)
 		}
-		if ok, _ := bucket.Exists(ctx, lock.DefaultPrefix+"job"); ok {
+		if ok, _ := bucket.Exists(ctx, blobster.DefaultLockPrefix+"job"); ok {
 			t.Fatal("record should not exist at default prefix")
 		}
 	})
 }
 
-func TestInvalidKeys(t *testing.T) {
+func TestLockerInvalidKeys(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		l := lock.New(backend)
+		l := blobster.NewLocker(backend)
 
 		for _, key := range []string{"", "/abs", "a/../b"} {
-			if _, err := l.TryAcquire(ctx, key); !errors.Is(err, lock.ErrInvalidKey) {
-				t.Errorf("TryAcquire(%q): got %v, want ErrInvalidKey", key, err)
+			if _, err := l.TryAcquire(ctx, key); !errors.Is(err, blobster.ErrInvalidLockKey) {
+				t.Errorf("TryAcquire(%q): got %v, want ErrInvalidLockKey", key, err)
 			}
 		}
 	})
 }
 
-func TestReleaseIdempotent(t *testing.T) {
+func TestLockerReleaseIdempotent(t *testing.T) {
 	t.Parallel()
-	eachBackend(t, func(t *testing.T, f backendFactory) {
+	eachLockBackend(t, func(t *testing.T, f lockBackendFactory) {
 		ctx := t.Context()
 		backend, _ := f.make(t)
-		l := lock.New(backend, lock.WithRenewInterval(time.Hour))
+		l := blobster.NewLocker(backend, blobster.WithRenewInterval(time.Hour))
 
 		held, err := l.TryAcquire(ctx, "job")
 		if err != nil {

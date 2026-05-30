@@ -305,20 +305,27 @@ permission details.
 ## Distributed lock (lease)
 
 A lock is a **generic lease algorithm over one conditional-write primitive**,
-not per-driver code. The `lock` package depends on its own minimal `Backend`
-interface — `Get`, `Create` (create-if-absent), `Update` (CAS-if-version-matches),
-`Delete` (delete-if-version-matches) on a single key — and the lease logic is
-shared across every backend. `lock.FromBucket(b)` adapts any `blobster.Bucket`
-(hence any driver that advertises `ConditionalWrites`) to a `Backend`, so a
-caller builds a native client once and uses it for both blob operations and
-locking; a caller with no blobster bucket can implement `Backend` directly over a
-native client. (Azure has a native `Lease Blob` API, but blobster builds on
-uniform CAS everywhere; a native lease is at most an optional Azure-specific
-optimization reachable via `As`, never the core algorithm.)
+not per-driver code. The lock lives in the **root `blobster` package** (it is a
+core coordination primitive and depends only on the root contract, so it is
+surfaced at the top level rather than in its own folder, unlike the heavier,
+capability-gated `multipart`/`xcopy` utilities). It is built on a minimal
+`LockBackend` interface — `Get`, `Create` (create-if-absent), `Update`
+(CAS-if-version-matches), `Delete` (delete-if-version-matches) on a single key —
+and the lease logic is shared across every backend. `LockBackendFromBucket(b)`
+adapts any `blobster.Bucket` (hence any driver that advertises
+`ConditionalWrites`) to a `LockBackend`, so a caller builds a native client once
+and uses it for both blob operations and locking; a caller with no blobster
+bucket can implement `LockBackend` directly over a native client. A
+`LockBackend` reports conditions with the package's existing sentinels —
+`ErrNotFound` (absent) and `ErrPreconditionFailed` (create-only/CAS not met) —
+so it needs no error vocabulary of its own. (Azure has a native `Lease Blob`
+API, but blobster builds on uniform CAS everywhere; a native lease is at most an
+optional Azure-specific optimization reachable via `As`, never the core
+algorithm.)
 
-A `Locker` is constructed over a `Backend` and a storage location
-(`WithPrefix`, default `.blobster/locks/`); it acquires many distinct locks by
-key. `Acquire`/`TryAcquire` take a key and an optional `WithOwner` (a random
+A `Locker` is constructed with `blobster.NewLocker(backend, …)` over a
+`LockBackend` and a storage location (`WithLockPrefix`, default
+`.blobster/locks/`); it acquires many distinct locks by key. `Acquire`/`TryAcquire` take a key and an optional `WithOwner` (a random
 owner is generated otherwise). The opaque version token (ETag/generation) is
 handled entirely inside the package — callers never see it.
 
@@ -436,12 +443,14 @@ pending copy per destination.
 
 The repository stays flat: the user-facing interfaces and shared types live in
 the root `blobster` package; everything with substantial implementation gets its
-own folder; docs live under `docs/`.
+own folder; docs live under `docs/`. The lock is the one deliberate exception —
+it depends only on the root contract and is a core primitive, so it lives in the
+root package rather than its own folder.
 
 ```
 blobster/            ← root package: Bucket + optional capability interfaces,
-                       Attributes, Precondition/conditions, errors, Capabilities
-lock/                ← lease lock, generic over a minimal conditional-write Backend
+                       Attributes, Precondition/conditions, errors, Capabilities,
+                       and the lease lock (Locker, Lock, LockBackend, NewLocker)
 multipart/           ← parallel-upload helper over MultipartUploader
 xcopy/               ← cross-region copy orchestration (Wait/Poll) over CrossRegionCopier
 mem/                 ← in-memory driver (reference implementation + test substrate)
@@ -461,18 +470,20 @@ README.md  LICENSE  go.mod  Makefile
 ### Dependency rule
 
 ```
-              ┌─────────── lock/ ─────────┐
-              │           multipart/      │  (utilities: depend on root interfaces only)
-              │           xcopy/          │
+              ┌──────── multipart/ ───────┐
+              │           xcopy/          │  (utilities: depend on root interfaces only)
               ▼                           ▼
-        blobster (root: interfaces + types)
+        blobster (root: interfaces + types + lease lock)
               ▲                           ▲
               │                           │
    mem/ file/ s3/ gcs/ azureblob/  (drivers: implement root interfaces; import only root)
 ```
 
 - Drivers import **only** the root `blobster` package (and their native SDK).
-- Utility packages (`lock`, `multipart`, `xcopy`) depend on the root
+- The lease lock lives in the root package; it depends only on the root
+  contract (no driver imports), so surfacing it at the top level keeps the
+  dependency graph one-directional.
+- Utility packages (`multipart`, `xcopy`) depend on the root
   **interfaces**, never on a concrete driver — so they work against any backend
   that advertises the needed capability.
 - No driver imports another driver. The arrows point one way.
@@ -498,11 +509,11 @@ Listing the bucket's caller-visible contents excludes the `.blobster/` subtree.
 Sentinel errors live in the root package and are `errors.Is`-matchable:
 `ErrNotFound`, `ErrPreconditionFailed`, `ErrUnsupported` (a capability the
 backend does not provide), and `ErrInvalidOption`. Drivers map native backend
-errors onto these so callers write backend-agnostic error handling. The `lock`
-package owns its own sentinels: `ErrLockHeld` (a live holder owns it),
-`ErrLockLost` (lease could not be renewed), `ErrInvalidKey`, and the
-`Backend`-contract errors `ErrNotExist` / `ErrExists` / `ErrConflict` that a
-custom `Backend` implementation must return.
+errors onto these so callers write backend-agnostic error handling. The lock
+adds `ErrLockHeld` (a live holder owns it), `ErrLockLost` (lease could not be
+renewed), and `ErrInvalidLockKey`; its `LockBackend` contract reuses
+`ErrNotFound` and `ErrPreconditionFailed` rather than introducing parallel
+sentinels.
 
 ## Non-goals / deferred
 
