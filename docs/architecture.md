@@ -9,8 +9,8 @@ GitHub issues.
 
 This describes both the implemented foundation and the **target** architecture.
 The base `Bucket` API, shared conformance tests, and the `mem`, `file`, `gcs`,
-and `s3` drivers are implemented. The `azure` driver plus the higher-level
-utilities are planned. The **backend API facts** the design depends on —
+`s3`, and `azure` drivers are implemented. The higher-level utilities are
+planned. The **backend API facts** the design depends on —
 conditional writes, cross-region copy, multipart — are verified against the
 providers' docs and Go SDKs; the evidence and exact API surfaces live in
 [`cloud-backend-research.md`](cloud-backend-research.md).
@@ -219,9 +219,9 @@ is no "region" to cross, but the interface is satisfied for uniform testing.
 ³ requires `gcs.WithSignedURLs`.
 
 Implemented today: base `Bucket`, conditional writes, copy, list/list-page,
-range reads for `mem`, `file`, `gcs`, and `s3`; signed URLs for `gcs` (with
-`WithSignedURLs`) and `s3`. Multipart, cross-region copy, and pinger are
-planned.
+range reads for `mem`, `file`, `gcs`, `s3`, and `azure`; signed URLs for `gcs`
+(with `WithSignedURLs`), `s3`, and `azure`. Multipart, cross-region copy, and
+pinger are planned.
 
 The `s3` driver wraps a caller-owned `*s3.Client` (`s3.New(client, bucket,
 ...)`): conditional writes map to `If-None-Match`/`If-Match` on PutObject and
@@ -247,11 +247,30 @@ version token and create/mod time, matching `mem`/`gcs`/`s3` (and diverging from
 `gocloud.dev/blob/fileblob`, which preserves the source's metadata) so every
 object carries its own identity.
 
+The `azure` driver wraps a caller-owned `*container.Client` (`azure.New(client,
+...)`) — an Azure container is the unit that maps to a blobster bucket, so the
+container client carries both the account endpoint and the container name, and
+no separate name argument is needed. Conditional writes map to
+`If-None-Match: *` (create-only) and `If-Match`/`If-None-Match` ETag conditions
+via `blob.ModifiedAccessConditions`, on both the write and delete paths. The
+version token is the blob's ETag. Streaming writes go through the block-blob
+`UploadStream` API over an `io.Pipe`; range reads reopen a `DownloadStream` per
+seek. A caller-supplied `ContentMD5` is enforced atomically server-side by
+routing the (necessarily bounded) body through a single `Put Blob` with a
+transactional Content-MD5 — `UploadStream` cannot validate a whole-object MD5
+across blocks, so unvalidated writes stay streaming and never buffer the whole
+blob while validated writes buffer. `Copy` is `Copy Blob`, which is
+asynchronous: the driver starts the copy and polls the destination's copy
+status to completion so the base synchronous `Copy` contract holds (same-account
+copies typically complete on the first poll). Signed URLs use the blob client's
+`GetSASURL`, which requires the container client to carry a shared-key
+credential.
+
 ## Testing
 
 The shared `blobtest` conformance suite defines the base bucket contract. The
 default test run exercises it against `mem` and `file` (real implementations,
-the latter via `t.TempDir()`) and against fake-backed `gcs`/`s3` wrappers
+the latter via `t.TempDir()`) and against fake-backed `gcs`/`s3`/`azure` wrappers
 (mem-backed) that verify the prefix/list/precondition plumbing without a network.
 The cloud drivers' real backends run the same suite behind the `cloud` build
 tag:
@@ -259,13 +278,16 @@ tag:
 ```sh
 BLOBSTER_GCS_BUCKET=my-test-bucket go test -tags cloud ./gcs
 BLOBSTER_S3_BUCKET=my-test-bucket  go test -tags cloud ./s3
+BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azure
 ```
 
 GCS uses standard Google Application Default Credentials; S3 uses the standard
-AWS default credential/region chain (`config.LoadDefaultConfig`). Each test
-writes under a unique prefix it attempts to clean up; `BLOBSTER_GCS_PREFIX` /
-`BLOBSTER_S3_PREFIX` force all test objects under a chosen prefix. See
-[`cloud-tests.md`](cloud-tests.md) for credential and permission details.
+AWS default credential/region chain (`config.LoadDefaultConfig`); Azure uses a
+shared-key connection string (which also enables SAS signing). Each test writes
+under a unique prefix it attempts to clean up; `BLOBSTER_GCS_PREFIX` /
+`BLOBSTER_S3_PREFIX` / `BLOBSTER_AZURE_PREFIX` force all test objects under a
+chosen prefix. See [`cloud-tests.md`](cloud-tests.md) for credential and
+permission details.
 
 ## Distributed lock (lease + fencing)
 
