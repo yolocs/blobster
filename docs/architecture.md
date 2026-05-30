@@ -308,26 +308,26 @@ A lock is a **generic lease algorithm over one conditional-write primitive**,
 not per-driver code. The lock lives in the **root `blobster` package** (it is a
 core coordination primitive and depends only on the root contract, so it is
 surfaced at the top level rather than in its own folder, unlike the heavier,
-capability-gated `multipart`/`xcopy` utilities). It is built on a minimal
-`LockBackend` interface — `Get`, `Create` (create-if-absent), `Update`
-(CAS-if-version-matches), `Delete` (delete-if-version-matches) on a single key —
-and the lease logic is shared across every backend. `LockBackendFromBucket(b)`
-adapts any `blobster.Bucket` (hence any driver that advertises
-`ConditionalWrites`) to a `LockBackend`, so a caller builds a native client once
-and uses it for both blob operations and locking; a caller with no blobster
-bucket can implement `LockBackend` directly over a native client. A
-`LockBackend` reports conditions with the package's existing sentinels —
-`ErrNotFound` (absent) and `ErrPreconditionFailed` (create-only/CAS not met) —
-so it needs no error vocabulary of its own. (Azure has a native `Lease Blob`
-API, but blobster builds on uniform CAS everywhere; a native lease is at most an
-optional Azure-specific optimization reachable via `As`, never the core
-algorithm.)
+capability-gated `multipart`/`xcopy` utilities). A `Locker` is constructed with
+`blobster.NewLocker(bucket, …)` over any `blobster.Bucket` that advertises
+`ConditionalWrites`, so a caller builds a native client once and uses the same
+driver for both blob operations and locking. Internally the lease logic needs
+only four conditional ops on a single key — read, create-if-absent,
+CAS-if-version-matches, delete-if-version-matches — expressed directly over the
+bucket's `Attributes`/`WriteAll`/`Delete` and reusing the package's existing
+sentinels (`ErrNotFound`, `ErrPreconditionFailed`); it has no error vocabulary
+of its own. (Azure has a native `Lease Blob` API, but blobster builds on uniform
+CAS everywhere; a native lease is at most an optional Azure-specific optimization
+reachable via `As`, never the core algorithm.)
 
-A `Locker` is constructed with `blobster.NewLocker(backend, …)` over a
-`LockBackend` and a storage location (`WithLockPrefix`, default
-`.blobster/locks/`); it acquires many distinct locks by key. `Acquire`/`TryAcquire` take a key and an optional `WithOwner` (a random
-owner is generated otherwise). The opaque version token (ETag/generation) is
-handled entirely inside the package — callers never see it.
+`NewLocker` acquires many distinct locks by key from one bucket+location
+(`WithLockPrefix`, default `.blobster/locks/`). `Acquire`/`TryAcquire` take a key
+and an optional `WithLockOwner` (a random owner is generated otherwise). The
+opaque version token (ETag/generation) is handled entirely inside the package —
+callers never see it. The background renewer runs on an **internal context**,
+independent of the context passed to `Acquire`: it is stopped only by `Release`
+or by losing the lease, so a request-scoped acquire context cancelling does not
+kill the renewer.
 
 A lock named `N` is backed by a single record at `.blobster/locks/<N>` whose
 state lives in the object's **user metadata** (empty body), so one `Get`
@@ -360,9 +360,13 @@ digraph lock {
   before a renew lands (or a renew CAS conflicts because someone took over), it
   declares the lock lost via the handle's `Done()`/`Err()` — liveness only, see
   below.
-- **Release** deletes the record with a CAS on the holder's version, so a
-  process can never delete a lock that has since been taken over. It is
-  idempotent and a no-op once the lock was lost.
+- **Release** stops the renewer and waits for it to exit (so no in-flight renew
+  can race the delete), then deletes the record only if it still names this
+  owner — so a process can never delete a lock that has since been taken over,
+  and an explicit Release leaves no stale record holding the lock until expiry.
+  It is idempotent and a safe no-op once the lock was lost. Its returned error
+  is authoritative for whether cleanup succeeded; `Err` is reserved for the
+  held-time lost-vs-clean distinction.
 
 **No fencing token — and why.** This is a lease lock, not a fencing lock. It
 gives mutual exclusion in the common case and self-heals on crash, but it does
@@ -450,7 +454,7 @@ root package rather than its own folder.
 ```
 blobster/            ← root package: Bucket + optional capability interfaces,
                        Attributes, Precondition/conditions, errors, Capabilities,
-                       and the lease lock (Locker, Lock, LockBackend, NewLocker)
+                       and the lease lock (Locker, Lock, NewLocker over a Bucket)
 multipart/           ← parallel-upload helper over MultipartUploader
 xcopy/               ← cross-region copy orchestration (Wait/Poll) over CrossRegionCopier
 mem/                 ← in-memory driver (reference implementation + test substrate)
@@ -511,9 +515,9 @@ Sentinel errors live in the root package and are `errors.Is`-matchable:
 backend does not provide), and `ErrInvalidOption`. Drivers map native backend
 errors onto these so callers write backend-agnostic error handling. The lock
 adds `ErrLockHeld` (a live holder owns it), `ErrLockLost` (lease could not be
-renewed), and `ErrInvalidLockKey`; its `LockBackend` contract reuses
-`ErrNotFound` and `ErrPreconditionFailed` rather than introducing parallel
-sentinels.
+renewed), and `ErrInvalidLockKey`; internally it reuses `ErrNotFound` and
+`ErrPreconditionFailed` to interpret the bucket's conditional ops rather than
+introducing parallel sentinels.
 
 ## Non-goals / deferred
 

@@ -25,7 +25,7 @@ var (
 	ErrInvalidLockKey = errors.New("blobster: invalid lock key")
 )
 
-// DefaultLockPrefix is the default location, relative to the backend's root, for
+// DefaultLockPrefix is the default location, relative to the bucket's root, for
 // lock records. It sits under the reserved .blobster/ prefix so it never
 // collides with caller keys.
 const DefaultLockPrefix = ".blobster/locks/"
@@ -38,96 +38,25 @@ const (
 	DefaultRetryInterval = 1 * time.Second
 )
 
-// Record field names stored in the backend (object metadata via
-// LockBackendFromBucket).
+// Record field names stored in the bucket as the lock object's user metadata.
+// They must be valid, verbatim-round-tripping metadata names on every backend;
+// both are already lowercase C# identifiers, which all drivers (including the
+// escaping azureblob driver) preserve.
 const (
 	lockOwnerField = "owner"
 	lockLeaseField = "lease"
 )
 
-// LockBackend is the minimal conditional single-object store the lock is built
-// on. All four operations act on one key; the version is an opaque token (an
-// ETag, a GCS generation, …) the lock never interprets beyond passing it back
-// for the next compare-and-swap. Implementations map these onto a backend's
-// native conditional-write primitive and report conditions with the package's
-// existing sentinels: ErrNotFound when a key is absent and ErrPreconditionFailed
-// when a create-only or compare-and-swap condition is not met.
-//
-// Use LockBackendFromBucket to derive a LockBackend from any blobster.Bucket; a
-// caller with no bucket can implement LockBackend directly over a native client.
-type LockBackend interface {
-	// Get returns the record's stored fields and current version, or ErrNotFound
-	// if the key is absent.
-	Get(ctx context.Context, key string) (fields map[string]string, version string, err error)
-
-	// Create stores fields at key only if the key does not yet exist, returning
-	// the new version. It returns ErrPreconditionFailed if the key already exists.
-	Create(ctx context.Context, key string, fields map[string]string) (version string, err error)
-
-	// Update stores fields at key only if the current version equals expected,
-	// returning the new version. It returns ErrPreconditionFailed if the version
-	// differs (or the key is gone).
-	Update(ctx context.Context, key string, fields map[string]string, expected string) (version string, err error)
-
-	// Delete removes key only if the current version equals expected. It returns
-	// ErrPreconditionFailed on a version mismatch and ErrNotFound if absent.
-	Delete(ctx context.Context, key string, expected string) error
-}
-
-// LockBackendFromBucket adapts a Bucket to a LockBackend, storing lock state in
-// the object's user metadata so a single Attributes read returns both the state
-// and the version token. The bucket must advertise ConditionalWrites; every
-// production driver does.
-func LockBackendFromBucket(b Bucket) LockBackend {
-	return bucketLockBackend{b: b}
-}
-
-type bucketLockBackend struct {
-	b Bucket
-}
-
-func (s bucketLockBackend) Get(ctx context.Context, key string) (map[string]string, string, error) {
-	attrs, err := s.b.Attributes(ctx, key)
-	if err != nil {
-		return nil, "", err
-	}
-	return attrs.Metadata, attrs.Version, nil
-}
-
-func (s bucketLockBackend) Create(ctx context.Context, key string, fields map[string]string) (string, error) {
-	opts := &WriterOptions{Metadata: fields, DisableContentTypeDetection: true}
-	if err := s.b.WriteAll(ctx, key, nil, opts, IfNotExists); err != nil {
-		return "", err
-	}
-	return s.version(ctx, key)
-}
-
-func (s bucketLockBackend) Update(ctx context.Context, key string, fields map[string]string, expected string) (string, error) {
-	opts := &WriterOptions{Metadata: fields, DisableContentTypeDetection: true}
-	if err := s.b.WriteAll(ctx, key, nil, opts, IfMatch(expected)); err != nil {
-		return "", err
-	}
-	return s.version(ctx, key)
-}
-
-func (s bucketLockBackend) Delete(ctx context.Context, key string, expected string) error {
-	return s.b.Delete(ctx, key, IfMatch(expected))
-}
-
-// version reads back the freshly written version token. The write path does not
-// return it, so the adapter pays one extra Attributes read; a native LockBackend
-// can return the new version from the write directly and skip this.
-func (s bucketLockBackend) version(ctx context.Context, key string) (string, error) {
-	attrs, err := s.b.Attributes(ctx, key)
-	if err != nil {
-		return "", err
-	}
-	return attrs.Version, nil
-}
-
-// Locker creates and contends for named locks over a single LockBackend. It is
-// safe for concurrent use. Construct one per backend+location with NewLocker and
+// Locker creates and contends for named locks over a single Bucket. It is safe
+// for concurrent use. Construct one per bucket+location with NewLocker and
 // acquire many distinct locks from it by key.
+//
+// Lock state lives in the lock object's user metadata (owner + an absolute lease
+// deadline), so a single Attributes read returns both the state and the opaque
+// version token that drives the compare-and-swap. The version token is never
+// exposed to callers. The bucket must advertise ConditionalWrites; every
+// production driver does. A caller builds a native client once and uses it for
+// both blob operations and locking by passing the same driver here.
 //
 // This is a lease lock, not a fencing lock. It provides mutual exclusion in the
 // common case and self-heals on crash (a dead holder's lease expires and the
@@ -139,18 +68,18 @@ func (s bucketLockBackend) version(ctx context.Context, key string) (string, err
 // idempotent, or guard a protected blob with its own conditional write, whose
 // version token already orders writers).
 type Locker struct {
-	backend LockBackend
-	prefix  string
-	lease   time.Duration
-	renew   time.Duration
-	retry   time.Duration
-	clock   func() time.Time
+	bucket Bucket
+	prefix string
+	lease  time.Duration
+	renew  time.Duration
+	retry  time.Duration
+	clock  func() time.Time
 }
 
 // LockerOption configures a Locker.
 type LockerOption func(*Locker)
 
-// WithLockPrefix sets where lock records are stored, relative to the backend's
+// WithLockPrefix sets where lock records are stored, relative to the bucket's
 // root. Defaults to DefaultLockPrefix (".blobster/locks/"). A trailing slash is
 // added if missing. Pass "" to store records directly at the root (not
 // recommended — it risks colliding with caller keys).
@@ -185,20 +114,22 @@ func WithRetryInterval(d time.Duration) LockerOption {
 }
 
 // WithLockClock injects the time source used for lease deadlines, mainly for
-// tests. Defaults to time.Now.
+// tests. It should track wall-clock rate, since lease deadlines are compared
+// against it on every host. Defaults to time.Now.
 func WithLockClock(now func() time.Time) LockerOption {
 	return func(l *Locker) { l.clock = now }
 }
 
-// NewLocker returns a Locker over backend. Use LockBackendFromBucket to build a
-// LockBackend from any blobster driver.
-func NewLocker(backend LockBackend, opts ...LockerOption) *Locker {
+// NewLocker returns a Locker that stores its records in bucket. Pass any
+// blobster driver (mem, file, s3, gcs, azureblob); the lock works on any bucket
+// that advertises ConditionalWrites.
+func NewLocker(bucket Bucket, opts ...LockerOption) *Locker {
 	l := &Locker{
-		backend: backend,
-		prefix:  DefaultLockPrefix,
-		lease:   DefaultLeaseDuration,
-		retry:   DefaultRetryInterval,
-		clock:   time.Now,
+		bucket: bucket,
+		prefix: DefaultLockPrefix,
+		lease:  DefaultLeaseDuration,
+		retry:  DefaultRetryInterval,
+		clock:  time.Now,
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -218,25 +149,29 @@ func NewLocker(backend LockBackend, opts ...LockerOption) *Locker {
 	return l
 }
 
-// AcquireOption configures a single acquisition.
-type AcquireOption func(*acquireConfig)
+// LockOption configures a single acquisition.
+type LockOption func(*acquireConfig)
 
 type acquireConfig struct {
 	owner string
 }
 
-// WithOwner sets the holder identity recorded in the lock. It is advisory
-// (useful in logs and for "who holds this") and not required for correctness.
-// When omitted, a random owner is generated per acquisition. Owners should be
-// unique per holder.
-func WithOwner(owner string) AcquireOption {
+// WithLockOwner sets the holder identity recorded in the lock. It is advisory
+// (useful in logs and for "who holds this") and not required for correctness,
+// though Release relies on it to recognize its own record, so owners should be
+// unique per holder. When omitted, a random owner is generated per acquisition.
+func WithLockOwner(owner string) LockOption {
 	return func(c *acquireConfig) { c.owner = owner }
 }
 
 // TryAcquire makes a single attempt to acquire the lock named key. It returns a
 // held Lock on success, ErrLockHeld if a live holder owns it, or another error
 // on backend failure.
-func (l *Locker) TryAcquire(ctx context.Context, key string, opts ...AcquireOption) (*Lock, error) {
+//
+// The returned Lock renews its lease on a background goroutine that runs on an
+// internal context, independent of ctx: it is stopped only by Release or by
+// losing the lease, not by canceling ctx (which governs only this call).
+func (l *Locker) TryAcquire(ctx context.Context, key string, opts ...LockOption) (*Lock, error) {
 	path, err := l.path(key)
 	if err != nil {
 		return nil, err
@@ -249,8 +184,9 @@ func (l *Locker) TryAcquire(ctx context.Context, key string, opts ...AcquireOpti
 }
 
 // Acquire blocks until the lock named key is acquired or ctx is done, retrying
-// with a jittered poll while the lock is held by someone else.
-func (l *Locker) Acquire(ctx context.Context, key string, opts ...AcquireOption) (*Lock, error) {
+// with a jittered poll while the lock is held by someone else. See TryAcquire
+// for the background renewer's lifecycle.
+func (l *Locker) Acquire(ctx context.Context, key string, opts ...LockOption) (*Lock, error) {
 	path, err := l.path(key)
 	if err != nil {
 		return nil, err
@@ -276,11 +212,11 @@ func (l *Locker) Acquire(ctx context.Context, key string, opts ...AcquireOption)
 }
 
 func (l *Locker) tryAcquire(ctx context.Context, key, path, owner string) (*Lock, error) {
-	fields, version, err := l.backend.Get(ctx, path)
+	fields, version, err := l.getRecord(ctx, path)
 	now := l.clock()
 	switch {
 	case errors.Is(err, ErrNotFound):
-		newVersion, cerr := l.backend.Create(ctx, path, l.record(owner, now))
+		newVersion, cerr := l.createRecord(ctx, path, l.record(owner, now))
 		if errors.Is(cerr, ErrPreconditionFailed) {
 			return nil, ErrLockHeld
 		}
@@ -297,7 +233,7 @@ func (l *Locker) tryAcquire(ctx context.Context, key, path, owner string) (*Lock
 		// Record exists but its lease has lapsed: take over with a CAS on the
 		// stale version. A losing racer (or a renew that just landed) trips the
 		// precondition and backs off.
-		newVersion, uerr := l.backend.Update(ctx, path, l.record(owner, now), version)
+		newVersion, uerr := l.updateRecord(ctx, path, l.record(owner, now), version)
 		if errors.Is(uerr, ErrPreconditionFailed) || errors.Is(uerr, ErrNotFound) {
 			return nil, ErrLockHeld
 		}
@@ -306,6 +242,48 @@ func (l *Locker) tryAcquire(ctx context.Context, key, path, owner string) (*Lock
 		}
 		return l.start(key, path, owner, newVersion, now.Add(l.lease)), nil
 	}
+}
+
+// getRecord reads a lock record's fields and version, returning ErrNotFound if
+// it is absent.
+func (l *Locker) getRecord(ctx context.Context, path string) (map[string]string, string, error) {
+	attrs, err := l.bucket.Attributes(ctx, path)
+	if err != nil {
+		return nil, "", err
+	}
+	return attrs.Metadata, attrs.Version, nil
+}
+
+// createRecord writes a record only if absent (ErrPreconditionFailed if it
+// exists) and returns its new version.
+func (l *Locker) createRecord(ctx context.Context, path string, fields map[string]string) (string, error) {
+	return l.writeRecord(ctx, path, fields, IfNotExists)
+}
+
+// updateRecord rewrites a record only if its version still matches expected
+// (ErrPreconditionFailed otherwise) and returns its new version.
+func (l *Locker) updateRecord(ctx context.Context, path string, fields map[string]string, expected string) (string, error) {
+	return l.writeRecord(ctx, path, fields, IfMatch(expected))
+}
+
+func (l *Locker) writeRecord(ctx context.Context, path string, fields map[string]string, precondition Precondition) (string, error) {
+	opts := &WriterOptions{Metadata: fields, DisableContentTypeDetection: true}
+	if err := l.bucket.WriteAll(ctx, path, nil, opts, precondition); err != nil {
+		return "", err
+	}
+	// The write path does not return the new version token, so read it back for
+	// the next compare-and-swap. We hold the record at this point (a create
+	// just succeeded, or our CAS did), so the read cannot observe a foreign
+	// write within the lease.
+	attrs, err := l.bucket.Attributes(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	return attrs.Version, nil
+}
+
+func (l *Locker) deleteRecord(ctx context.Context, path, expected string) error {
+	return l.bucket.Delete(ctx, path, IfMatch(expected))
 }
 
 func (l *Locker) record(owner string, now time.Time) map[string]string {
@@ -331,7 +309,7 @@ func lockExpired(fields map[string]string, now time.Time) bool {
 }
 
 func (l *Locker) jitteredRetry() time.Duration {
-	// Full jitter in [retry, 2*retry) to spread contenders off the hot object.
+	// Full jitter in [retry, 2*retry] to spread contenders off the hot object.
 	return l.retry + time.Duration(rand.Int64N(int64(l.retry)+1))
 }
 
@@ -345,7 +323,7 @@ func (l *Locker) path(key string) (string, error) {
 	return l.prefix + key, nil
 }
 
-func resolveOwner(opts []AcquireOption) (string, error) {
+func resolveOwner(opts []LockOption) (string, error) {
 	var cfg acquireConfig
 	for _, opt := range opts {
 		opt(&cfg)
@@ -375,6 +353,7 @@ type Lock struct {
 	owner  string
 
 	cancelRenew context.CancelFunc
+	stopped     chan struct{} // closed when the renewer goroutine has exited
 
 	mu         sync.Mutex
 	version    string
@@ -393,6 +372,7 @@ func (l *Locker) start(key, path, owner, version string, leaseUntil time.Time) *
 		path:        path,
 		owner:       owner,
 		cancelRenew: cancel,
+		stopped:     make(chan struct{}),
 		version:     version,
 		leaseUntil:  leaseUntil,
 		done:        make(chan struct{}),
@@ -420,9 +400,12 @@ func (lk *Lock) Err() error {
 	return lk.err
 }
 
-// Release relinquishes the lock, stopping the renewer and deleting the record if
-// it still belongs to this holder. It is safe to call more than once and never
-// deletes a lock that has since been taken over by another holder.
+// Release relinquishes the lock: it stops the renewer, waits for it to exit so
+// no further renew can race, and deletes the record if it still belongs to this
+// holder. It never deletes a lock taken over by another holder, and is safe to
+// call more than once (including after the lease was lost). The returned error
+// is authoritative for whether cleanup succeeded; Err is reserved for the
+// held-time lost-vs-clean distinction.
 func (lk *Lock) Release(ctx context.Context) error {
 	lk.mu.Lock()
 	if lk.released {
@@ -430,22 +413,36 @@ func (lk *Lock) Release(ctx context.Context) error {
 		return nil
 	}
 	lk.released = true
-	version := lk.version
 	lk.mu.Unlock()
 
 	lk.cancelRenew()
+	<-lk.stopped // the renewer has exited; no more writes can race the delete
 	lk.finish(nil)
 
-	err := lk.locker.backend.Delete(ctx, lk.path, version)
-	if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
-		// Already taken over or gone: our CAS deleted nothing, which is exactly
-		// the safety we want. We no longer hold it, so report success.
+	// The renewer's final Update may have committed a newer version even if its
+	// context was canceled mid-flight, so trust the backend rather than our
+	// cached version. Only delete a record that is still ours.
+	fields, version, err := lk.locker.getRecord(ctx, lk.path)
+	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if fields[lockOwnerField] != lk.owner {
+		return nil // taken over by another holder; nothing of ours to delete
+	}
+	if err := lk.locker.deleteRecord(ctx, lk.path, version); err != nil {
+		if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (lk *Lock) renewLoop(ctx context.Context) {
+	defer close(lk.stopped)
 	ticker := time.NewTicker(lk.locker.renew)
 	defer ticker.Stop()
 	for {
@@ -481,7 +478,7 @@ func (lk *Lock) renewOnce(ctx context.Context, now time.Time) error {
 	version := lk.version
 	lk.mu.Unlock()
 
-	newVersion, err := lk.locker.backend.Update(ctx, lk.path, lk.locker.record(lk.owner, now), version)
+	newVersion, err := lk.locker.updateRecord(ctx, lk.path, lk.locker.record(lk.owner, now), version)
 	if err != nil {
 		return err
 	}
