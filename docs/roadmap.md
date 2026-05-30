@@ -37,9 +37,14 @@ pin the interface and are the test substrate everything else relies on.
   `file` by default and real backends behind a build tag.
 
 ### Distributed lock
-- Lease + fencing lock, generic over `ConditionalWrites`: acquire/renew/release,
-  takeover on lease expiry, monotonic fencing token returned to the holder.
-- Helpers for guarding protected-resource writes with the fencing token.
+- Lease lock over the conditional-write primitive: acquire/try-acquire/renew/
+  release, takeover on lease expiry. Built and shipped in the root package
+  (`blobster.NewLocker(bucket, …)`, over any driver that advertises
+  `ConditionalWrites`). Fencing tokens were considered and deliberately dropped —
+  the lock coordinates multi-object/external critical sections and documents an
+  honest best-effort-under-pause contract rather than implying exactly-once (see
+  `architecture.md`). A caller builds a native client once and passes the same
+  driver for both blob ops and locking.
 
 ### Multipart parallel upload
 - Generic helper over `MultipartUploader`: split, upload parts with bounded

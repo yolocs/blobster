@@ -302,61 +302,93 @@ under a unique prefix it attempts to clean up; `BLOBSTER_GCS_PREFIX` /
 chosen prefix. See [`cloud-tests.md`](cloud-tests.md) for credential and
 permission details.
 
-## Distributed lock (lease + fencing)
+## Distributed lock (lease)
 
-A lock is a **generic algorithm over the conditional-write primitive**, not
-per-driver code: the `lock` package works on any `Bucket` that advertises
-`ConditionalWrites`. Only the conditional primitive differs between backends;
-the lease logic is shared. (Azure has a native `Lease Blob` API, but it yields
-no fencing token, so blobster builds the lock on uniform CAS everywhere; a native
-lease is at most an optional Azure-specific optimization, never the core
-algorithm.)
+A lock is a **generic lease algorithm over one conditional-write primitive**,
+not per-driver code. The lock lives in the **root `blobster` package** (it is a
+core coordination primitive and depends only on the root contract, so it is
+surfaced at the top level rather than in its own folder, unlike the heavier,
+capability-gated `multipart`/`xcopy` utilities). A `Locker` is constructed with
+`blobster.NewLocker(bucket, …)` over any `blobster.Bucket` that advertises
+`ConditionalWrites`, so a caller builds a native client once and uses the same
+driver for both blob operations and locking. Internally the lease logic needs
+only four conditional ops on a single key — read, create-if-absent,
+CAS-if-version-matches, delete-if-version-matches — expressed directly over the
+bucket's `Attributes`/`WriteAll`/`Delete` and reusing the package's existing
+sentinels (`ErrNotFound`, `ErrPreconditionFailed`); it has no error vocabulary
+of its own. (Azure has a native `Lease Blob` API, but blobster builds on uniform
+CAS everywhere; a native lease is at most an optional Azure-specific optimization
+reachable via `As`, never the core algorithm.)
 
-A lock named `N` is backed by a single record at `.blobster/locks/<N>` holding:
+`NewLocker` acquires many distinct locks by key from one bucket+location
+(`WithLockPrefix`, default `.blobster/locks/`). `Acquire`/`TryAcquire` take a key
+and an optional `WithLockOwner` (a random owner is generated otherwise). The
+opaque version token (ETag/generation) is handled entirely inside the package —
+callers never see it. The background renewer runs on an **internal context**,
+independent of the context passed to `Acquire`: it is stopped only by `Release`
+or by losing the lease, so a request-scoped acquire context cancelling does not
+kill the renewer.
+
+A lock named `N` is backed by a single record at `.blobster/locks/<N>` whose
+state lives in the object's **user metadata** (empty body), so one `Get`
+(`Attributes`) returns both the state and the version token atomically:
 
 ```
-owner        — unique id of the current holder (random per acquisition)
-lease_until  — absolute deadline after which the lease is considered expired
-fence        — monotonically increasing fencing token, bumped on every acquisition
+owner        — id of the current holder (advisory; for logs / "who holds this")
+lease         — absolute deadline (RFC3339Nano) after which the lease is expired
 ```
 
 ```dot
 digraph lock {
   rankdir=LR;
   free      [label="free\n(no record or expired)"];
-  held      [label="held\n(owner, lease_until, fence)"];
-  free -> held  [label="Acquire:\nIfNotExists create, or\nIfMatch takeover if expired\n(bump fence)"];
-  held -> held  [label="Renew:\nIfMatch extend lease_until\nbefore deadline"];
-  held -> free  [label="Release:\nIfMatch delete\n(never deletes another owner's lock)"];
+  held      [label="held\n(owner, lease)"];
+  free -> held  [label="Acquire:\nCreate if absent, or\nUpdate (CAS) takeover if expired"];
+  held -> held  [label="Renew:\nUpdate (CAS) extend lease\nbefore deadline"];
+  held -> free  [label="Release:\nDelete (CAS)\n(never deletes another owner's lock)"];
   held -> free  [label="Lease expiry:\nholder crashed; next\nAcquire takes over"];
 }
 ```
 
-- **Acquire** writes the record with `IfNotExists`. If the record exists but its
-  `lease_until` is in the past, the acquirer takes over with `IfMatch` on the
-  stale record's version and **bumps `fence`**. The compare-and-swap guarantees
-  exactly one winner under contention.
-- **Hold** runs a background renewer that extends `lease_until` via `IfMatch`
-  well before the deadline. If renewal fails (lost the lock, backend error), the
-  holder is notified through the lock handle so it can stop work.
-- **Release** deletes the record with `IfMatch` on the holder's version, so a
-  process can never delete a lock that has since been taken over.
-- **Fencing token.** `Acquire` returns the monotonically increasing `fence`. A
-  correct holder includes it on writes to the resource it protects (e.g. via an
-  `IfMatch`/`IfNotMatch` guard or an application-level check), so a paused holder
-  whose lease expired cannot corrupt state after a newer holder has taken over.
-  This is the property a TTL-only lock lacks; blobster surfaces the token rather
-  than pretending mutual exclusion alone is safe under arbitrary pauses.
+- **Acquire** creates the record if absent. If it exists but its `lease` is in
+  the past, the acquirer takes over with a CAS on the stale version. The
+  compare-and-swap guarantees exactly one winner under contention;
+  `TryAcquire` returns `ErrLockHeld` when a live holder owns it, while `Acquire`
+  retries with jittered backoff until acquired or the context is done.
+- **Hold** runs a background renewer that extends `lease` via CAS each renew
+  interval. The renewer self-expires conservatively: if its own deadline passes
+  before a renew lands (or a renew CAS conflicts because someone took over), it
+  declares the lock lost via the handle's `Done()`/`Err()` — liveness only, see
+  below.
+- **Release** stops the renewer and waits for it to exit (so no in-flight renew
+  can race the delete), then deletes the record only if it still names this
+  owner — so a process can never delete a lock that has since been taken over,
+  and an explicit Release leaves no stale record holding the lock until expiry.
+  It is idempotent and a safe no-op once the lock was lost. Its returned error
+  is authoritative for whether cleanup succeeded; `Err` is reserved for the
+  held-time lost-vs-clean distinction.
 
-Clock handling, the safety margin between renew interval and lease length, and
-behavior on backend unavailability are spelled out by the implementing issue and
-this section is updated when it lands.
+**No fencing token — and why.** This is a lease lock, not a fencing lock. It
+gives mutual exclusion in the common case and self-heals on crash, but it does
+**not** protect against a holder that pauses (GC, VM freeze) past its lease and
+resumes after a successor starts — a frozen process cannot observe its own
+freeze, so no self-check (`IsExpired`-style) can be safe, and the handle's
+loss signal is therefore documented as liveness, never a correctness guard. We
+deliberately do not surface a fencing token: the lock's purpose is to coordinate
+critical sections that span **multiple objects or external systems**, where a
+single monotonic token would only partially help and would force every protected
+resource to implement fence-checking. Safety under arbitrary pauses is the
+caller's responsibility — keep sections short and make effects idempotent. Note
+that when the protected resource is a single blobster object, its own
+conditional write (`IfMatch` on the object's version) already orders writers and
+rejects a stale holder's overwrite, so no separate token is needed there.
 
 **Backend constraint on timing.** GCS throttles writes to ~1 per second *per
 object name*. Because the lock record is a single hot object, lease and renew
-intervals must be second-scale (not sub-second), with jittered backoff on
-throttling. This effectively sets the floor for the renew/lease margin uniformly
-across backends — see [`cloud-backend-research.md`](cloud-backend-research.md).
+intervals are second-scale (default lease 15s, renew lease/3), not sub-second,
+with jittered acquire backoff. This sets the floor for the renew/lease margin
+uniformly across backends — see
+[`cloud-backend-research.md`](cloud-backend-research.md).
 
 ## Multipart parallel upload
 
@@ -415,12 +447,14 @@ pending copy per destination.
 
 The repository stays flat: the user-facing interfaces and shared types live in
 the root `blobster` package; everything with substantial implementation gets its
-own folder; docs live under `docs/`.
+own folder; docs live under `docs/`. The lock is the one deliberate exception —
+it depends only on the root contract and is a core primitive, so it lives in the
+root package rather than its own folder.
 
 ```
 blobster/            ← root package: Bucket + optional capability interfaces,
-                       Attributes, Precondition/conditions, errors, Capabilities
-lock/                ← lease + fencing lock, generic over ConditionalWrites
+                       Attributes, Precondition/conditions, errors, Capabilities,
+                       and the lease lock (Locker, Lock, NewLocker over a Bucket)
 multipart/           ← parallel-upload helper over MultipartUploader
 xcopy/               ← cross-region copy orchestration (Wait/Poll) over CrossRegionCopier
 mem/                 ← in-memory driver (reference implementation + test substrate)
@@ -440,18 +474,20 @@ README.md  LICENSE  go.mod  Makefile
 ### Dependency rule
 
 ```
-              ┌─────────── lock/ ─────────┐
-              │           multipart/      │  (utilities: depend on root interfaces only)
-              │           xcopy/          │
+              ┌──────── multipart/ ───────┐
+              │           xcopy/          │  (utilities: depend on root interfaces only)
               ▼                           ▼
-        blobster (root: interfaces + types)
+        blobster (root: interfaces + types + lease lock)
               ▲                           ▲
               │                           │
    mem/ file/ s3/ gcs/ azureblob/  (drivers: implement root interfaces; import only root)
 ```
 
 - Drivers import **only** the root `blobster` package (and their native SDK).
-- Utility packages (`lock`, `multipart`, `xcopy`) depend on the root
+- The lease lock lives in the root package; it depends only on the root
+  contract (no driver imports), so surfacing it at the top level keeps the
+  dependency graph one-directional.
+- Utility packages (`multipart`, `xcopy`) depend on the root
   **interfaces**, never on a concrete driver — so they work against any backend
   that advertises the needed capability.
 - No driver imports another driver. The arrows point one way.
@@ -476,9 +512,12 @@ Listing the bucket's caller-visible contents excludes the `.blobster/` subtree.
 
 Sentinel errors live in the root package and are `errors.Is`-matchable:
 `ErrNotFound`, `ErrPreconditionFailed`, `ErrUnsupported` (a capability the
-backend does not provide), and the lock's `ErrLockHeld` / `ErrLockLost`.
-Drivers map native backend errors onto these so callers write backend-agnostic
-error handling.
+backend does not provide), and `ErrInvalidOption`. Drivers map native backend
+errors onto these so callers write backend-agnostic error handling. The lock
+adds `ErrLockHeld` (a live holder owns it), `ErrLockLost` (lease could not be
+renewed), and `ErrInvalidLockKey`; internally it reuses `ErrNotFound` and
+`ErrPreconditionFailed` to interpret the bucket's conditional ops rather than
+introducing parallel sentinels.
 
 ## Non-goals / deferred
 
