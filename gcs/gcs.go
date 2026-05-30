@@ -462,7 +462,7 @@ func (b *storageBackend) object(key string) *storage.ObjectHandle {
 	return b.client.Bucket(b.bucket).Object(key)
 }
 
-func (b *storageBackend) openReader(ctx context.Context, key string, offset, length int64) (*storage.Reader, *blobster.Attributes, error) {
+func (b *storageBackend) openReader(ctx context.Context, key string, offset, length int64) (objectReader, *blobster.Attributes, error) {
 	reader, err := b.object(key).NewRangeReader(ctx, offset, length)
 	if err != nil {
 		return nil, nil, mapError(err)
@@ -477,6 +477,11 @@ func (b *storageBackend) openReader(ctx context.Context, key string, offset, len
 		Native:          reader,
 	}
 	return reader, attrs, nil
+}
+
+type objectReader interface {
+	io.ReadCloser
+	io.WriterTo
 }
 
 type writeCloser struct {
@@ -505,14 +510,17 @@ func (w *writeCloser) ReadFrom(r io.Reader) (int64, error) {
 	return io.Copy(w.w, r)
 }
 
+// gcsReader implements Seek by closing the current network reader and opening a
+// new GCS range reader. That preserves the Reader contract but is expensive for
+// seek-heavy callers.
 type gcsReader struct {
 	ctx    context.Context
-	open   func(context.Context, string, int64, int64) (*storage.Reader, *blobster.Attributes, error)
+	open   func(context.Context, string, int64, int64) (objectReader, *blobster.Attributes, error)
 	key    string
 	start  int64
 	length int64
 	pos    int64
-	reader *storage.Reader
+	reader objectReader
 	attrs  *blobster.Attributes
 	closed bool
 }
@@ -534,11 +542,7 @@ func (r *gcsReader) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		target = r.pos + offset
 	case io.SeekEnd:
-		if r.length >= 0 {
-			target = r.length + offset
-		} else {
-			target = r.attrs.Size - r.start + offset
-		}
+		target = r.rangeSize() + offset
 	default:
 		return 0, fmt.Errorf("%w: invalid seek whence", blobster.ErrInvalidOption)
 	}
@@ -588,12 +592,16 @@ func (r *gcsReader) reopen(pos int64) error {
 			return err
 		}
 	}
+	size := r.length
+	if r.attrs != nil {
+		size = r.rangeSize()
+	}
 	length := int64(-1)
 	if r.length >= 0 {
-		if pos > r.length {
-			pos = r.length
+		if pos > size {
+			pos = size
 		}
-		length = r.length - pos
+		length = size - pos
 	}
 	reader, attrs, err := r.open(r.ctx, r.key, r.start+pos, length)
 	if err != nil {
@@ -604,6 +612,20 @@ func (r *gcsReader) reopen(pos int64) error {
 	r.pos = pos
 	r.closed = false
 	return nil
+}
+
+func (r *gcsReader) rangeSize() int64 {
+	if r.attrs == nil {
+		return r.length
+	}
+	size := r.attrs.Size - r.start
+	if size < 0 {
+		size = 0
+	}
+	if r.length >= 0 && r.length < size {
+		return r.length
+	}
+	return size
 }
 
 func convertAttrs(attrs *storage.ObjectAttrs) *blobster.Attributes {

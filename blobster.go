@@ -189,25 +189,26 @@ func NewListIterator(bucket Bucket, opts *ListOptions) *ListIterator {
 }
 
 func (i *ListIterator) Next(ctx context.Context) (*ListObject, error) {
-	if len(i.page) > 0 {
-		next := i.page[0]
-		i.page = i.page[1:]
-		return next, nil
-	}
-	if i.done {
-		return nil, io.EOF
-	}
+	for {
+		if len(i.page) > 0 {
+			next := i.page[0]
+			i.page = i.page[1:]
+			return next, nil
+		}
+		if i.done {
+			return nil, io.EOF
+		}
 
-	page, next, err := i.bucket.ListPage(ctx, i.pageToken, i.pageSize, i.opts)
-	if err != nil {
-		return nil, err
+		page, next, err := i.bucket.ListPage(ctx, i.pageToken, i.pageSize, i.opts)
+		if err != nil {
+			return nil, err
+		}
+		i.pageToken = bytes.Clone(next)
+		if len(next) == 0 {
+			i.done = true
+		}
+		i.page = page
 	}
-	i.pageToken = bytes.Clone(next)
-	if len(next) == 0 {
-		i.done = true
-	}
-	i.page = page
-	return i.Next(ctx)
 }
 
 func (i *ListIterator) All(ctx context.Context) (iter.Seq2[*ListObject, func(io.Writer, *ReaderOptions) error], func() error) {

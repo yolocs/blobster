@@ -1,9 +1,12 @@
 package gcs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -82,8 +85,59 @@ func TestSignedURLUsesBackendCapability(t *testing.T) {
 	}
 }
 
+func TestGCSReaderSeekEndClampsBoundedRangeToObjectRemainder(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	type openedRange struct {
+		Offset int64
+		Length int64
+	}
+	var opened []openedRange
+	reader := &gcsReader{
+		ctx:    ctx,
+		key:    "letters",
+		start:  20,
+		length: 20,
+		open: func(ctx context.Context, key string, offset, length int64) (objectReader, *blobster.Attributes, error) {
+			opened = append(opened, openedRange{Offset: offset, Length: length})
+			return &fakeObjectReader{Reader: bytes.NewReader(nil)}, &blobster.Attributes{
+				ContentType: "text/plain",
+				Size:        26,
+			}, nil
+		},
+	}
+	if err := reader.reopen(0); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reader.Close()
+
+	pos, err := reader.Seek(0, io.SeekEnd)
+	if err != nil {
+		t.Fatalf("SeekEnd: %v", err)
+	}
+	if pos != 6 {
+		t.Fatalf("SeekEnd position = %d, want actual remaining range size 6", pos)
+	}
+	wantOpened := []openedRange{
+		{Offset: 20, Length: 20},
+		{Offset: 26, Length: 0},
+	}
+	if diff := cmp.Diff(wantOpened, opened); diff != "" {
+		t.Fatalf("opened ranges mismatch (-want +got):\n%s", diff)
+	}
+}
+
+type fakeObjectReader struct {
+	*bytes.Reader
+}
+
+func (r *fakeObjectReader) Close() error {
+	return nil
+}
+
 type fakeBackend struct {
 	bucket                 blobster.Bucket
+	mu                     sync.Mutex
 	signedURL              bool
 	lastWriteKey           string
 	lastWritePreconditions blobster.Preconditions
@@ -99,13 +153,17 @@ func (b *fakeBackend) Attributes(ctx context.Context, key string) (*blobster.Att
 }
 
 func (b *fakeBackend) NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error) {
+	b.mu.Lock()
 	b.lastReadKey = key
+	b.mu.Unlock()
 	return b.bucket.NewRangeReader(ctx, key, offset, length, opts)
 }
 
 func (b *fakeBackend) NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error) {
+	b.mu.Lock()
 	b.lastWriteKey = key
 	b.lastWritePreconditions = preconditions
+	b.mu.Unlock()
 	return b.bucket.NewWriter(ctx, key, opts, preconditionsToList(preconditions)...)
 }
 

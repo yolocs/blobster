@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -205,6 +206,56 @@ func TestBucket(t *testing.T, newBucket BucketFactory) {
 		}
 		if err := bucket.Delete(ctx, "cas", blobster.IfMatch(attrs.Version)); err != nil {
 			t.Fatalf("IfMatch Delete: %v", err)
+		}
+	})
+
+	t.Run("concurrent create-only writes have exactly one winner", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		bucket := newBucket(t)
+
+		bodies := [][]byte{
+			[]byte("writer-0"),
+			[]byte("writer-1"),
+		}
+		start := make(chan struct{})
+		results := make(chan error, len(bodies))
+		var wg sync.WaitGroup
+		wg.Add(len(bodies))
+		for _, body := range bodies {
+			body := body
+			go func() {
+				defer wg.Done()
+				<-start
+				results <- bucket.WriteAll(ctx, "race-create", body, &blobster.WriterOptions{ContentType: "text/plain"}, blobster.IfNotExists)
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		successes := 0
+		preconditionFailures := 0
+		for err := range results {
+			switch {
+			case err == nil:
+				successes++
+			case errors.Is(err, blobster.ErrPreconditionFailed):
+				preconditionFailures++
+			default:
+				t.Fatalf("concurrent WriteAll error = %v, want nil or ErrPreconditionFailed", err)
+			}
+		}
+		if successes != 1 || preconditionFailures != len(bodies)-1 {
+			t.Fatalf("successes=%d preconditionFailures=%d, want 1 success and %d precondition failure", successes, preconditionFailures, len(bodies)-1)
+		}
+
+		got, err := bucket.ReadAll(ctx, "race-create")
+		if err != nil {
+			t.Fatalf("ReadAll race-created object: %v", err)
+		}
+		if !bytes.Equal(got, bodies[0]) && !bytes.Equal(got, bodies[1]) {
+			t.Fatalf("race-created body = %q, want one writer body", string(got))
 		}
 	})
 
