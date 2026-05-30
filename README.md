@@ -19,12 +19,13 @@ Implemented:
 - `gcs` driver built from a caller-owned `*storage.Client`
 - `s3` driver built from a caller-owned `*s3.Client` (conditional
   writes, streaming multipart uploads, server-side copy, presigned URLs)
-- shared conformance tests plus GCS and S3 cloud tests behind the `cloud`
-  build tag
+- `azureblob` driver built from a caller-owned `*container.Client` (conditional
+  writes, streaming block-blob uploads, async server-side copy, SAS URLs)
+- shared conformance tests plus GCS, S3, and Azure cloud tests behind the
+  `cloud` build tag
 
 Planned:
 
-- `azure` driver
 - multipart upload, distributed locks, and cross-region copy helpers
 
 ## Example

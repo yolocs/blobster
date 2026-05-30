@@ -58,3 +58,34 @@ Conditional writes require S3's recent support: `If-None-Match` (create-only, GA
 2024-08), `If-Match` on PUT (CAS, GA 2024-11), and `If-Match` on DELETE
 (conditional delete, GA 2025-09). Test against a general-purpose bucket in a
 region where these are available.
+
+## Azure
+
+Run:
+
+```sh
+BLOBSTER_AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net" \
+  BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azureblob
+```
+
+Optional:
+
+```sh
+BLOBSTER_AZURE_PREFIX=blobster/manual/ \
+  BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azureblob
+```
+
+The test builds a `*container.Client` from the connection string via
+`container.NewClientFromConnectionString`. A shared-key connection string is used
+(rather than a token credential) because it also enables SAS signing, which the
+signed-URL conformance case exercises. The credential needs permission to read
+container properties, and to list/create/read/copy/delete blobs in
+`BLOBSTER_AZURE_CONTAINER`. The container must already exist. The test writes
+under a unique prefix named `blobster-cloud-<timestamp>/` beneath
+`BLOBSTER_AZURE_PREFIX` and attempts cleanup at the end.
+
+Conditional writes map to `If-None-Match: *` (create-only) and
+`If-Match`/`If-None-Match` ETag conditions; all are supported on both write and
+delete. `Copy` uses the asynchronous Copy Blob operation polled to completion;
+same-account copies (the only kind the base `Copy` performs) typically complete
+on the first poll.
