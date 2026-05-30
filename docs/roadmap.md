@@ -37,9 +37,13 @@ pin the interface and are the test substrate everything else relies on.
   `file` by default and real backends behind a build tag.
 
 ### Distributed lock
-- Lease + fencing lock, generic over `ConditionalWrites`: acquire/renew/release,
-  takeover on lease expiry, monotonic fencing token returned to the holder.
-- Helpers for guarding protected-resource writes with the fencing token.
+- Lease lock, generic over a minimal conditional-write `Backend`:
+  acquire/try-acquire/renew/release, takeover on lease expiry. Built and shipped
+  in `lock/`. Fencing tokens were considered and deliberately dropped — the lock
+  coordinates multi-object/external critical sections and documents an honest
+  best-effort-under-pause contract rather than implying exactly-once (see
+  `architecture.md`). Native-client construction via per-backend drivers adapted
+  with `lock.FromBucket`, or a caller-supplied `Backend`.
 
 ### Multipart parallel upload
 - Generic helper over `MultipartUploader`: split, upload parts with bounded

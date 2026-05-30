@@ -302,61 +302,82 @@ under a unique prefix it attempts to clean up; `BLOBSTER_GCS_PREFIX` /
 chosen prefix. See [`cloud-tests.md`](cloud-tests.md) for credential and
 permission details.
 
-## Distributed lock (lease + fencing)
+## Distributed lock (lease)
 
-A lock is a **generic algorithm over the conditional-write primitive**, not
-per-driver code: the `lock` package works on any `Bucket` that advertises
-`ConditionalWrites`. Only the conditional primitive differs between backends;
-the lease logic is shared. (Azure has a native `Lease Blob` API, but it yields
-no fencing token, so blobster builds the lock on uniform CAS everywhere; a native
-lease is at most an optional Azure-specific optimization, never the core
-algorithm.)
+A lock is a **generic lease algorithm over one conditional-write primitive**,
+not per-driver code. The `lock` package depends on its own minimal `Backend`
+interface — `Get`, `Create` (create-if-absent), `Update` (CAS-if-version-matches),
+`Delete` (delete-if-version-matches) on a single key — and the lease logic is
+shared across every backend. `lock.FromBucket(b)` adapts any `blobster.Bucket`
+(hence any driver that advertises `ConditionalWrites`) to a `Backend`, so a
+caller builds a native client once and uses it for both blob operations and
+locking; a caller with no blobster bucket can implement `Backend` directly over a
+native client. (Azure has a native `Lease Blob` API, but blobster builds on
+uniform CAS everywhere; a native lease is at most an optional Azure-specific
+optimization reachable via `As`, never the core algorithm.)
 
-A lock named `N` is backed by a single record at `.blobster/locks/<N>` holding:
+A `Locker` is constructed over a `Backend` and a storage location
+(`WithPrefix`, default `.blobster/locks/`); it acquires many distinct locks by
+key. `Acquire`/`TryAcquire` take a key and an optional `WithOwner` (a random
+owner is generated otherwise). The opaque version token (ETag/generation) is
+handled entirely inside the package — callers never see it.
+
+A lock named `N` is backed by a single record at `.blobster/locks/<N>` whose
+state lives in the object's **user metadata** (empty body), so one `Get`
+(`Attributes`) returns both the state and the version token atomically:
 
 ```
-owner        — unique id of the current holder (random per acquisition)
-lease_until  — absolute deadline after which the lease is considered expired
-fence        — monotonically increasing fencing token, bumped on every acquisition
+owner        — id of the current holder (advisory; for logs / "who holds this")
+lease         — absolute deadline (RFC3339Nano) after which the lease is expired
 ```
 
 ```dot
 digraph lock {
   rankdir=LR;
   free      [label="free\n(no record or expired)"];
-  held      [label="held\n(owner, lease_until, fence)"];
-  free -> held  [label="Acquire:\nIfNotExists create, or\nIfMatch takeover if expired\n(bump fence)"];
-  held -> held  [label="Renew:\nIfMatch extend lease_until\nbefore deadline"];
-  held -> free  [label="Release:\nIfMatch delete\n(never deletes another owner's lock)"];
+  held      [label="held\n(owner, lease)"];
+  free -> held  [label="Acquire:\nCreate if absent, or\nUpdate (CAS) takeover if expired"];
+  held -> held  [label="Renew:\nUpdate (CAS) extend lease\nbefore deadline"];
+  held -> free  [label="Release:\nDelete (CAS)\n(never deletes another owner's lock)"];
   held -> free  [label="Lease expiry:\nholder crashed; next\nAcquire takes over"];
 }
 ```
 
-- **Acquire** writes the record with `IfNotExists`. If the record exists but its
-  `lease_until` is in the past, the acquirer takes over with `IfMatch` on the
-  stale record's version and **bumps `fence`**. The compare-and-swap guarantees
-  exactly one winner under contention.
-- **Hold** runs a background renewer that extends `lease_until` via `IfMatch`
-  well before the deadline. If renewal fails (lost the lock, backend error), the
-  holder is notified through the lock handle so it can stop work.
-- **Release** deletes the record with `IfMatch` on the holder's version, so a
-  process can never delete a lock that has since been taken over.
-- **Fencing token.** `Acquire` returns the monotonically increasing `fence`. A
-  correct holder includes it on writes to the resource it protects (e.g. via an
-  `IfMatch`/`IfNotMatch` guard or an application-level check), so a paused holder
-  whose lease expired cannot corrupt state after a newer holder has taken over.
-  This is the property a TTL-only lock lacks; blobster surfaces the token rather
-  than pretending mutual exclusion alone is safe under arbitrary pauses.
+- **Acquire** creates the record if absent. If it exists but its `lease` is in
+  the past, the acquirer takes over with a CAS on the stale version. The
+  compare-and-swap guarantees exactly one winner under contention;
+  `TryAcquire` returns `ErrLockHeld` when a live holder owns it, while `Acquire`
+  retries with jittered backoff until acquired or the context is done.
+- **Hold** runs a background renewer that extends `lease` via CAS each renew
+  interval. The renewer self-expires conservatively: if its own deadline passes
+  before a renew lands (or a renew CAS conflicts because someone took over), it
+  declares the lock lost via the handle's `Done()`/`Err()` — liveness only, see
+  below.
+- **Release** deletes the record with a CAS on the holder's version, so a
+  process can never delete a lock that has since been taken over. It is
+  idempotent and a no-op once the lock was lost.
 
-Clock handling, the safety margin between renew interval and lease length, and
-behavior on backend unavailability are spelled out by the implementing issue and
-this section is updated when it lands.
+**No fencing token — and why.** This is a lease lock, not a fencing lock. It
+gives mutual exclusion in the common case and self-heals on crash, but it does
+**not** protect against a holder that pauses (GC, VM freeze) past its lease and
+resumes after a successor starts — a frozen process cannot observe its own
+freeze, so no self-check (`IsExpired`-style) can be safe, and the handle's
+loss signal is therefore documented as liveness, never a correctness guard. We
+deliberately do not surface a fencing token: the lock's purpose is to coordinate
+critical sections that span **multiple objects or external systems**, where a
+single monotonic token would only partially help and would force every protected
+resource to implement fence-checking. Safety under arbitrary pauses is the
+caller's responsibility — keep sections short and make effects idempotent. Note
+that when the protected resource is a single blobster object, its own
+conditional write (`IfMatch` on the object's version) already orders writers and
+rejects a stale holder's overwrite, so no separate token is needed there.
 
 **Backend constraint on timing.** GCS throttles writes to ~1 per second *per
 object name*. Because the lock record is a single hot object, lease and renew
-intervals must be second-scale (not sub-second), with jittered backoff on
-throttling. This effectively sets the floor for the renew/lease margin uniformly
-across backends — see [`cloud-backend-research.md`](cloud-backend-research.md).
+intervals are second-scale (default lease 15s, renew lease/3), not sub-second,
+with jittered acquire backoff. This sets the floor for the renew/lease margin
+uniformly across backends — see
+[`cloud-backend-research.md`](cloud-backend-research.md).
 
 ## Multipart parallel upload
 
@@ -420,7 +441,7 @@ own folder; docs live under `docs/`.
 ```
 blobster/            ← root package: Bucket + optional capability interfaces,
                        Attributes, Precondition/conditions, errors, Capabilities
-lock/                ← lease + fencing lock, generic over ConditionalWrites
+lock/                ← lease lock, generic over a minimal conditional-write Backend
 multipart/           ← parallel-upload helper over MultipartUploader
 xcopy/               ← cross-region copy orchestration (Wait/Poll) over CrossRegionCopier
 mem/                 ← in-memory driver (reference implementation + test substrate)
@@ -476,9 +497,12 @@ Listing the bucket's caller-visible contents excludes the `.blobster/` subtree.
 
 Sentinel errors live in the root package and are `errors.Is`-matchable:
 `ErrNotFound`, `ErrPreconditionFailed`, `ErrUnsupported` (a capability the
-backend does not provide), and the lock's `ErrLockHeld` / `ErrLockLost`.
-Drivers map native backend errors onto these so callers write backend-agnostic
-error handling.
+backend does not provide), and `ErrInvalidOption`. Drivers map native backend
+errors onto these so callers write backend-agnostic error handling. The `lock`
+package owns its own sentinels: `ErrLockHeld` (a live holder owns it),
+`ErrLockLost` (lease could not be renewed), `ErrInvalidKey`, and the
+`Backend`-contract errors `ErrNotExist` / `ErrExists` / `ErrConflict` that a
+custom `Backend` implementation must return.
 
 ## Non-goals / deferred
 
