@@ -29,7 +29,7 @@ type Bucket interface {
 	As(i any) bool
 	Attributes(ctx context.Context, key string) (*Attributes, error)
 	Close() error
-	Copy(ctx context.Context, dstKey, srcKey string, opts *CopyOptions, preconditions ...Precondition) error
+	Copy(ctx context.Context, dstKey, srcKey string, opts *CopyOptions) error
 	Delete(ctx context.Context, key string, preconditions ...Precondition) error
 	Download(ctx context.Context, key string, w io.Writer, opts *ReaderOptions) error
 	ErrorAs(err error, i any) bool

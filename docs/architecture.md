@@ -93,7 +93,7 @@ relative to the bucket's root prefix. Reads and writes stream.
 As(i any) bool
 Attributes(ctx, key) (*Attributes, error)  // size, version, content-type, mod time, user metadata
 Close() error
-Copy(ctx, dstKey, srcKey, *CopyOptions, ...Precondition) error
+Copy(ctx, dstKey, srcKey, *CopyOptions) error
 Delete(ctx, key, ...Precondition) error
 Download(ctx, key, io.Writer, *ReaderOptions) error
 ErrorAs(err, i any) bool
@@ -120,7 +120,13 @@ Capabilities() Capabilities
   cancel must **not** leave a partial, readable object. This matters for
   `mem`/`file`, where a naive close would otherwise commit a truncated body, and
   for cloud drivers where uploads have explicit abort/error-close paths.
-- **Preconditions** (next section) are accepted by the write and delete paths.
+- **Preconditions** (next section) are accepted by the write and delete paths
+  only. `Copy` is an unconditional server-side copy on every backend — it takes
+  no preconditions, matching `gocloud.dev/blob` and avoiding a precondition
+  affordance that S3's `CopyObject` (which exposes only *source* conditions)
+  could not honor on the destination. Callers needing native source conditions
+  use `CopyOptions.BeforeCopy`; callers needing a conditional *result* compose
+  `Copy` with a conditional `Delete`/`Write`.
 - Convenience `ReadAll`/`WriteAll`/`Upload`/`Download` methods wrap the streaming
   pair for small objects and common copy-to/from-stream cases; the streaming
   reader/writer methods remain the core contract.
@@ -220,11 +226,10 @@ planned.
 The `s3` driver wraps a caller-owned `*s3.Client` (`s3.New(client, bucket,
 ...)`): conditional writes map to `If-None-Match`/`If-Match` on PutObject and
 the multipart-complete path; streaming writes go through the SDK's upload
-manager over an `io.Pipe`; range reads reopen a `GetObject` per seek. Because
-S3's `CopyObject` exposes only *source* preconditions, blobster's `Copy` is
-server-side and unconditional — a destination precondition returns
-`ErrUnsupported`. Conditional delete uses `If-Match` (the only destination
-condition DeleteObject accepts).
+manager over an `io.Pipe`; range reads reopen a `GetObject` per seek. `Copy` is
+a server-side `CopyObject` (the base `Copy` is unconditional on every backend).
+Conditional delete uses `If-Match` (the only destination condition DeleteObject
+accepts).
 
 ## Testing
 

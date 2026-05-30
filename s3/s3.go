@@ -77,12 +77,8 @@ func (b *Bucket) Close() error {
 	return nil
 }
 
-func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions ...blobster.Precondition) error {
-	compiled, err := blobster.CompilePreconditions(preconditions)
-	if err != nil {
-		return err
-	}
-	return b.backend.Copy(ctx, b.objectKey(dstKey), b.objectKey(srcKey), opts, compiled)
+func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
+	return b.backend.Copy(ctx, b.objectKey(dstKey), b.objectKey(srcKey), opts)
 }
 
 func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobster.Precondition) error {
@@ -225,7 +221,7 @@ type backend interface {
 	NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error)
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
-	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions blobster.Preconditions) error
+	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
 	ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error)
 	IsAccessible(ctx context.Context) (bool, error)
 	SignedURL(ctx context.Context, key string, opts *blobster.SignedURLOptions) (string, error)
@@ -395,10 +391,7 @@ func (b *s3Backend) Delete(ctx context.Context, key string, preconditions blobst
 	return nil
 }
 
-func (b *s3Backend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions blobster.Preconditions) error {
-	if preconditions.IfNotExists || preconditions.IfMatch != "" || preconditions.IfNotMatch != "" {
-		return fmt.Errorf("%w: S3 CopyObject cannot apply destination preconditions", blobster.ErrUnsupported)
-	}
+func (b *s3Backend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
 	input := &s3.CopyObjectInput{
 		Bucket:     aws.String(b.bucket),
 		Key:        aws.String(dstKey),

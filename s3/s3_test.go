@@ -183,8 +183,8 @@ func (b *fakeBackend) Delete(ctx context.Context, key string, preconditions blob
 	return b.bucket.Delete(ctx, key, preconditionsToList(preconditions)...)
 }
 
-func (b *fakeBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions blobster.Preconditions) error {
-	return b.bucket.Copy(ctx, dstKey, srcKey, opts, preconditionsToList(preconditions)...)
+func (b *fakeBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
+	return b.bucket.Copy(ctx, dstKey, srcKey, opts)
 }
 
 func (b *fakeBackend) ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error) {

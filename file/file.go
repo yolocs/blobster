@@ -73,7 +73,7 @@ func (b *Bucket) Close() error {
 	return nil
 }
 
-func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions ...blobster.Precondition) error {
+func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -81,10 +81,6 @@ func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster
 		if err := opts.BeforeCopy(func(any) bool { return false }); err != nil {
 			return err
 		}
-	}
-	compiled, err := blobster.CompilePreconditions(preconditions)
-	if err != nil {
-		return err
 	}
 	srcPath, err := b.path(srcKey)
 	if err != nil {
@@ -105,14 +101,6 @@ func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster
 	srcAttrs, err := b.readAttributes(srcPath)
 	if err != nil {
 		return err
-	}
-
-	current, exists, err := b.statVersion(dstPath)
-	if err != nil {
-		return err
-	}
-	if !conditionsPass(compiled, current, exists) {
-		return fmt.Errorf("%w: %s", blobster.ErrPreconditionFailed, dstKey)
 	}
 
 	attrs := srcAttrs.Clone()

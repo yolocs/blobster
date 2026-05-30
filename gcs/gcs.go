@@ -84,12 +84,8 @@ func (b *Bucket) Close() error {
 	return nil
 }
 
-func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions ...blobster.Precondition) error {
-	compiled, err := blobster.CompilePreconditions(preconditions)
-	if err != nil {
-		return err
-	}
-	return b.backend.Copy(ctx, b.objectKey(dstKey), b.objectKey(srcKey), opts, compiled)
+func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
+	return b.backend.Copy(ctx, b.objectKey(dstKey), b.objectKey(srcKey), opts)
 }
 
 func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobster.Precondition) error {
@@ -232,7 +228,7 @@ type backend interface {
 	NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error)
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
-	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions blobster.Preconditions) error
+	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
 	ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error)
 	IsAccessible(ctx context.Context) (bool, error)
 	SignedURL(ctx context.Context, key string, opts *blobster.SignedURLOptions) (string, error)
@@ -322,22 +318,14 @@ func (b *storageBackend) Delete(ctx context.Context, key string, preconditions b
 	return mapError(obj.Delete(ctx))
 }
 
-func (b *storageBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions, preconditions blobster.Preconditions) error {
-	dst := b.object(dstKey)
-	conds, ok, err := gcsConditions(preconditions)
-	if err != nil {
-		return err
-	}
-	if ok {
-		dst = dst.If(conds)
-	}
-	copier := dst.CopierFrom(b.object(srcKey))
+func (b *storageBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
+	copier := b.object(dstKey).CopierFrom(b.object(srcKey))
 	if opts != nil && opts.BeforeCopy != nil {
 		if err := opts.BeforeCopy(func(i any) bool { return blobster.AssignNative(copier, i) }); err != nil {
 			return err
 		}
 	}
-	_, err = copier.Run(ctx)
+	_, err := copier.Run(ctx)
 	return mapError(err)
 }
 
