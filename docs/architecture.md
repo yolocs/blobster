@@ -7,12 +7,12 @@ it describes. For how we work on the project see [`../AGENTS.md`](../AGENTS.md);
 for the planning backlog see [`roadmap.md`](roadmap.md); committed work lives in
 GitHub issues.
 
-This describes the **target** architecture. The repository is currently being
-bootstrapped, so everything below is *planned* unless a section says otherwise;
-as code lands, sections should note what is implemented versus planned. The
-**backend API facts** the design depends on — conditional writes, cross-region
-copy, multipart — are verified against the providers' docs and Go SDKs; the
-evidence and exact API surfaces live in
+This describes both the implemented foundation and the **target** architecture.
+The base `Bucket` API, shared conformance tests, the `mem` driver, and the GCS
+driver are implemented. The `file`, `s3`, and `azure` drivers plus the
+higher-level utilities are planned. The **backend API facts** the design depends
+on — conditional writes, cross-region copy, multipart — are verified against
+the providers' docs and Go SDKs; the evidence and exact API surfaces live in
 [`cloud-backend-research.md`](cloud-backend-research.md).
 
 ## What this project is
@@ -55,7 +55,9 @@ These hold across the whole system; everything below is built to preserve them.
    connection URL. This maximizes the caller's control over how the native
    client is configured (custom endpoint, credentials provider, retryer,
    transport) and makes the dependency graph explicit. blobster never closes a
-   client it did not open.
+   client it did not open. The implemented GCS driver follows this shape with
+   `gcs.New(client, bucketName, ...)`, where `client` is a caller-owned
+   `*storage.Client`.
 3. **A prefix is the root.** A `Bucket` is rooted at a key prefix; every key a
    caller supplies is relative to that root, and `Sub(prefix)` returns another
    `Bucket` rooted deeper. A caller can therefore treat any subtree of a
@@ -73,11 +75,12 @@ These hold across the whole system; everything below is built to preserve them.
    concurrency — "write/delete this key only if it is absent / only if its
    current version matches" — is the single mechanism on which all coordination
    (the lock today, a queue later) is built. Every production driver must
-   provide it; the `mem` and `file` drivers emulate it faithfully.
+   provide it; the implemented `mem` and GCS drivers provide it, and the
+   planned `file` driver will emulate it faithfully.
 6. **`mem` and `file` are first-class, not test doubles.** They implement the
    same interface and the same conditional semantics as the cloud drivers, so
    unit and local-integration tests run the real code paths. There is no mock
-   `Bucket` for storage behavior.
+   `Bucket` for storage behavior. `mem` is implemented; `file` is planned.
 
 ## The base `Bucket` interface
 
@@ -85,14 +88,25 @@ The common denominator every driver implements. Keys are opaque strings
 relative to the bucket's root prefix. Reads and writes stream.
 
 ```
-Attributes(ctx, key) (Attributes, error)   // size, etag/version, content-type, mod time, user metadata
-Exists(ctx, key) (bool, error)
-NewReader(ctx, key, *ReaderOptions) (Reader, error)   // range-aware streaming read
-NewWriter(ctx, key, *WriterOptions) (Writer, error)   // streaming write; commit on Close
+As(i any) bool
+Attributes(ctx, key) (*Attributes, error)  // size, version, content-type, mod time, user metadata
+Close() error
+Copy(ctx, dstKey, srcKey, *CopyOptions, ...Precondition) error
 Delete(ctx, key, ...Precondition) error
-Copy(ctx, dstKey, srcKey, *CopyOptions) error          // intra-bucket, server-side where possible
-List(ctx, *ListOptions) Iterator                       // prefix + optional delimiter
-Sub(prefix) Bucket                                     // re-root at a deeper prefix
+Download(ctx, key, io.Writer, *ReaderOptions) error
+ErrorAs(err, i any) bool
+Exists(ctx, key) (bool, error)
+IsAccessible(ctx) (bool, error)
+List(*ListOptions) *ListIterator
+ListPage(ctx, pageToken, pageSize, *ListOptions) ([]*ListObject, nextPageToken, error)
+NewRangeReader(ctx, key, offset, length, *ReaderOptions) (Reader, error)
+NewReader(ctx, key, *ReaderOptions) (Reader, error)
+NewWriter(ctx, key, *WriterOptions) (Writer, error)   // streaming write; commit on Close, abort on CloseWithError
+ReadAll(ctx, key) ([]byte, error)
+SignedURL(ctx, key, *SignedURLOptions) (string, error)
+Sub(prefix) Bucket
+Upload(ctx, key, io.Reader, *WriterOptions, ...Precondition) error
+WriteAll(ctx, key, []byte, *WriterOptions, ...Precondition) error
 Capabilities() Capabilities
 ```
 
@@ -100,17 +114,21 @@ Capabilities() Capabilities
   generation, an Azure ETag) that feeds conditional operations. blobster does
   not interpret it beyond equality.
 - **`NewWriter`** returns a `Writer` whose bytes are committed on `Close`; a
-  writer abandoned via its cancelable context (or a context cancel) must **not**
-  leave a partial, readable object. This matters for `mem`/`file`, where a naive
-  close would otherwise commit a truncated body.
+  writer abandoned via `CloseWithError`, its cancelable context, or a context
+  cancel must **not** leave a partial, readable object. This matters for
+  `mem`/`file`, where a naive close would otherwise commit a truncated body, and
+  for cloud drivers where uploads have explicit abort/error-close paths.
 - **Preconditions** (next section) are accepted by the write and delete paths.
-- Convenience `ReadAll`/`WriteAll` helpers wrap the streaming pair for small
-  objects; they are sugar, not the contract.
+- Convenience `ReadAll`/`WriteAll`/`Upload`/`Download` methods wrap the streaming
+  pair for small objects and common copy-to/from-stream cases; the streaming
+  reader/writer methods remain the core contract.
 
-`ReaderOptions` carries a byte range; `WriterOptions` carries content type and
-user metadata; `ListOptions` carries prefix, delimiter, and page size; the
-`Iterator` yields entries (key, size, mod time, is-prefix) and is paged
-internally. Order is backend-defined — sort caller-side if it matters.
+`NewRangeReader` carries the byte range explicitly; `WriterOptions` carries
+content headers, user metadata, optional MD5 validation, and the same
+content-type sniffing controls exposed by Go Cloud; `ListOptions` carries prefix
+and delimiter; `ListPage` carries page token and page size. The iterator yields
+entries (key, size, mod time, is-prefix) and pages internally. Order is
+backend-defined — sort caller-side if it matters.
 
 ## Conditional writes (the coordination primitive)
 
@@ -128,7 +146,7 @@ Mapping per backend:
 | Backend | `IfNotExists` | `IfMatch` / `IfNotMatch` |
 |--------|---------------|--------------------------|
 | `s3`    | `If-None-Match: *` on PUT | `If-Match` / `If-None-Match` on the conditional write |
-| `gcs`   | `ifGenerationMatch: 0` | `ifGenerationMatch` / `ifGenerationNotMatch` |
+| `gcs`   | `storage.Conditions{DoesNotExist: true}` | `GenerationMatch` / `GenerationNotMatch` |
 | `azure` | `If-None-Match: *` | `If-Match` / `If-None-Match` (ETag) |
 | `mem`   | in-process compare under a lock | version compare under a lock |
 | `file`  | exclusive create (`O_CREAT|O_EXCL`) + atomic rename | version (mod-time+size or sidecar) compare + atomic rename |
@@ -146,9 +164,9 @@ per-SDK error matching is recorded in
 
 ## Optional capabilities
 
-Each is a Go interface a driver may also implement, paired with a flag in the
-`Capabilities` descriptor for runtime introspection. Callers obtain them by type
-assertion:
+Each future optional capability is a Go interface a driver may also implement,
+paired with a flag in the `Capabilities` descriptor for runtime introspection.
+Callers obtain future optional capabilities by type assertion:
 
 ```go
 if mu, ok := bucket.(blobster.MultipartUploader); ok { /* use native multipart */ }
@@ -162,14 +180,17 @@ if mu, ok := bucket.(blobster.MultipartUploader); ok { /* use native multipart *
 - **`CrossRegionCopier`** — initiates a backend-native copy that may target a
   different region/bucket and returns a `CopyOperation` handle (some backends
   copy synchronously, some asynchronously — see below).
-- **`SignedURLer`** — presigned GET/PUT URLs (S3, GCS, Azure). `mem`/`file`
-  return "unsupported" so callers fall back to streaming.
+- **Signed URLs** are exposed on the base bucket because Go Cloud exposes them as
+  a basic bucket operation. Drivers that cannot sign return `ErrUnsupported` and
+  set `Capabilities().SignedURL` to false. The GCS driver supports signed URLs
+  when constructed with `gcs.WithSignedURLs`.
 - **`Pinger`** — a cheap reachability probe for readiness checks.
 
-`Capabilities` is a small struct of booleans (`ConditionalWrites`, `Multipart`,
-`CrossRegionCopy`, `SignedURL`, …). The optional interface is the load-bearing
-mechanism (it gives you the methods); the descriptor exists so code can branch,
-log, or fail fast without a type assertion per capability.
+`Capabilities` is a small struct of booleans (`ConditionalWrites`, `Copy`,
+`List`, `ListPage`, `RangeRead`, `SignedURL`, and future multipart/cross-region
+flags). For future optional interfaces, the interface is the load-bearing
+mechanism; the descriptor exists so code can branch, log, or fail fast without a
+type assertion per capability.
 
 ### Capability matrix (target)
 
@@ -179,12 +200,34 @@ log, or fail fast without a type assertion per capability.
 | `ConditionalWrites`|  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `MultipartUploader`|  ✅¹  |  ✅¹   | ✅   |  ✅   |  ✅     |
 | `CrossRegionCopier`|  ✅²  |  ✅²   | ✅   |  ✅   |  ✅     |
-| `SignedURLer`      |  ❌   |  ❌    | ✅   |  ✅   |  ✅     |
+| Signed URLs        |  ❌   |  ❌    | ✅   |  ✅³  |  ✅     |
 | `Pinger`           |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 
 ¹ local (non-native) implementation — correct, but not a true server-side
 multipart. ² intra-process / intra-host copy between two blobster buckets; there
 is no "region" to cross, but the interface is satisfied for uniform testing.
+³ requires `gcs.WithSignedURLs`.
+
+Implemented today: base `Bucket`, conditional writes, copy, list/list-page,
+range reads, and signed URL hooks for `mem` and GCS. Multipart, cross-region
+copy, and pinger are planned.
+
+## Testing
+
+The shared `blobtest` conformance suite defines the base bucket contract and is
+run against `mem` and a fake-backed GCS wrapper in the default test suite. GCS
+cloud tests live behind the `cloud` build tag:
+
+```sh
+BLOBSTER_GCS_BUCKET=my-test-bucket go test -tags cloud ./gcs
+```
+
+The test uses standard Google Application Default Credentials. Set either
+`GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json` or use
+`gcloud auth application-default login`. The credential needs permission to read
+bucket attributes, list/create/read/copy/delete objects, and the test writes
+under a unique prefix that it attempts to clean up. `BLOBSTER_GCS_PREFIX` can be
+set to force all test objects under a chosen prefix.
 
 ## Distributed lock (lease + fencing)
 
