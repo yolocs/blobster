@@ -31,3 +31,30 @@ The test writes under a unique prefix named `blobster-cloud-<timestamp>/` beneat
 Signed URL support is part of the driver API but is not exercised by the cloud
 test yet. To use it in application code, construct the bucket with
 `gcs.WithSignedURLs` and provide either a private key or a `SignBytes` function.
+
+## S3
+
+Run:
+
+```sh
+BLOBSTER_S3_BUCKET=my-test-bucket go test -tags cloud ./s3
+```
+
+Optional:
+
+```sh
+BLOBSTER_S3_PREFIX=blobster/manual/ BLOBSTER_S3_BUCKET=my-test-bucket go test -tags cloud ./s3
+```
+
+Credentials and region come from the standard AWS default chain loaded by
+`github.com/aws/aws-sdk-go-v2/config.LoadDefaultConfig` — environment variables
+(`AWS_REGION`, `AWS_ACCESS_KEY_ID`, …), a shared profile, or an instance/role
+provider. The credential needs permission to head the bucket, and to
+list/create/read/copy/delete objects under `BLOBSTER_S3_BUCKET`. The test writes
+under a unique prefix named `blobster-cloud-<timestamp>/` beneath
+`BLOBSTER_S3_PREFIX` and attempts cleanup at the end.
+
+Conditional writes require S3's recent support: `If-None-Match` (create-only, GA
+2024-08), `If-Match` on PUT (CAS, GA 2024-11), and `If-Match` on DELETE
+(conditional delete, GA 2025-09). Test against a general-purpose bucket in a
+region where these are available.

@@ -14,12 +14,17 @@ Implemented:
   upload/download helpers, delete, copy, list/list-page, sub-buckets,
   capabilities, preconditions, and signed URL hooks
 - `mem` driver with real conditional-write semantics
+- `file` driver with atomic writes and conditional semantics (write-temp +
+  rename under a per-bucket lock)
 - `gcs` driver built from a caller-owned `*storage.Client`
-- shared conformance tests plus GCS cloud tests behind the `cloud` build tag
+- `s3` driver built from a caller-owned `*s3.Client` (conditional
+  writes, streaming multipart uploads, server-side copy, presigned URLs)
+- shared conformance tests plus GCS and S3 cloud tests behind the `cloud`
+  build tag
 
 Planned:
 
-- `file`, `s3`, and `azure` drivers
+- `azure` driver
 - multipart upload, distributed locks, and cross-region copy helpers
 
 ## Example

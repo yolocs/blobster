@@ -8,11 +8,11 @@ for the planning backlog see [`roadmap.md`](roadmap.md); committed work lives in
 GitHub issues.
 
 This describes both the implemented foundation and the **target** architecture.
-The base `Bucket` API, shared conformance tests, the `mem` driver, and the GCS
-driver are implemented. The `file`, `s3`, and `azure` drivers plus the
-higher-level utilities are planned. The **backend API facts** the design depends
-on — conditional writes, cross-region copy, multipart — are verified against
-the providers' docs and Go SDKs; the evidence and exact API surfaces live in
+The base `Bucket` API, shared conformance tests, and the `mem`, `file`, `gcs`,
+and `s3` drivers are implemented. The `azure` driver plus the higher-level
+utilities are planned. The **backend API facts** the design depends on —
+conditional writes, cross-region copy, multipart — are verified against the
+providers' docs and Go SDKs; the evidence and exact API surfaces live in
 [`cloud-backend-research.md`](cloud-backend-research.md).
 
 ## What this project is
@@ -75,12 +75,14 @@ These hold across the whole system; everything below is built to preserve them.
    concurrency — "write/delete this key only if it is absent / only if its
    current version matches" — is the single mechanism on which all coordination
    (the lock today, a queue later) is built. Every production driver must
-   provide it; the implemented `mem` and GCS drivers provide it, and the
-   planned `file` driver will emulate it faithfully.
+   provide it; the implemented `mem`, `file`, `gcs`, and `s3` drivers all
+   provide it. `file` emulates it with an atomic write-temp + rename committed
+   under a per-bucket lock.
 6. **`mem` and `file` are first-class, not test doubles.** They implement the
    same interface and the same conditional semantics as the cloud drivers, so
    unit and local-integration tests run the real code paths. There is no mock
-   `Bucket` for storage behavior. `mem` is implemented; `file` is planned.
+   `Bucket` for storage behavior. Both are implemented and run the shared
+   conformance suite in the default test run.
 
 ## The base `Bucket` interface
 
@@ -183,7 +185,9 @@ if mu, ok := bucket.(blobster.MultipartUploader); ok { /* use native multipart *
 - **Signed URLs** are exposed on the base bucket because Go Cloud exposes them as
   a basic bucket operation. Drivers that cannot sign return `ErrUnsupported` and
   set `Capabilities().SignedURL` to false. The GCS driver supports signed URLs
-  when constructed with `gcs.WithSignedURLs`.
+  when constructed with `gcs.WithSignedURLs`; the S3 driver always supports them
+  via the SDK presigner (GET/PUT/DELETE), so `mem` and `file` are the only
+  drivers without signing.
 - **`Pinger`** — a cheap reachability probe for readiness checks.
 
 `Capabilities` is a small struct of booleans (`ConditionalWrites`, `Copy`,
@@ -209,25 +213,38 @@ is no "region" to cross, but the interface is satisfied for uniform testing.
 ³ requires `gcs.WithSignedURLs`.
 
 Implemented today: base `Bucket`, conditional writes, copy, list/list-page,
-range reads, and signed URL hooks for `mem` and GCS. Multipart, cross-region
-copy, and pinger are planned.
+range reads for `mem`, `file`, `gcs`, and `s3`; signed URLs for `gcs` (with
+`WithSignedURLs`) and `s3`. Multipart, cross-region copy, and pinger are
+planned.
+
+The `s3` driver wraps a caller-owned `*s3.Client` (`s3.New(client, bucket,
+...)`): conditional writes map to `If-None-Match`/`If-Match` on PutObject and
+the multipart-complete path; streaming writes go through the SDK's upload
+manager over an `io.Pipe`; range reads reopen a `GetObject` per seek. Because
+S3's `CopyObject` exposes only *source* preconditions, blobster's `Copy` is
+server-side and unconditional — a destination precondition returns
+`ErrUnsupported`. Conditional delete uses `If-Match` (the only destination
+condition DeleteObject accepts).
 
 ## Testing
 
-The shared `blobtest` conformance suite defines the base bucket contract and is
-run against `mem` and a fake-backed GCS wrapper in the default test suite. GCS
-cloud tests live behind the `cloud` build tag:
+The shared `blobtest` conformance suite defines the base bucket contract. The
+default test run exercises it against `mem` and `file` (real implementations,
+the latter via `t.TempDir()`) and against fake-backed `gcs`/`s3` wrappers
+(mem-backed) that verify the prefix/list/precondition plumbing without a network.
+The cloud drivers' real backends run the same suite behind the `cloud` build
+tag:
 
 ```sh
 BLOBSTER_GCS_BUCKET=my-test-bucket go test -tags cloud ./gcs
+BLOBSTER_S3_BUCKET=my-test-bucket  go test -tags cloud ./s3
 ```
 
-The test uses standard Google Application Default Credentials. Set either
-`GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json` or use
-`gcloud auth application-default login`. The credential needs permission to read
-bucket attributes, list/create/read/copy/delete objects, and the test writes
-under a unique prefix that it attempts to clean up. `BLOBSTER_GCS_PREFIX` can be
-set to force all test objects under a chosen prefix.
+GCS uses standard Google Application Default Credentials; S3 uses the standard
+AWS default credential/region chain (`config.LoadDefaultConfig`). Each test
+writes under a unique prefix it attempts to clean up; `BLOBSTER_GCS_PREFIX` /
+`BLOBSTER_S3_PREFIX` force all test objects under a chosen prefix. See
+[`cloud-tests.md`](cloud-tests.md) for credential and permission details.
 
 ## Distributed lock (lease + fencing)
 
