@@ -3,11 +3,15 @@
 // semantics as the cloud drivers, so it is suitable for local integration and
 // small single-host deployments.
 //
-// Each object is stored as two files under the bucket root: the data file at the
-// object's path and a JSON sidecar at "<path>.attrs" holding content headers,
-// user metadata, the MD5, and an opaque version token. Writes are atomic
-// (write-to-temp + rename) and conditional writes/deletes are serialized through
-// a per-bucket lock so create-only and compare-and-swap have exactly one winner.
+// Storage is split into three sibling subtrees under the bucket root: caller
+// objects live under "data/<key>", a JSON metadata sidecar (content headers,
+// user metadata, MD5, size, and an opaque version token) lives under
+// "meta/<key>", and in-flight temp files live under "tmp/". Keeping metadata and
+// temps in separate trees means no caller key can ever collide with bookkeeping
+// state. Writes are atomic (write-to-temp + rename) and conditional
+// writes/deletes are serialized through a per-bucket lock so create-only and
+// compare-and-swap have exactly one winner; readers take the same lock while
+// reading committed state so they never observe a half-applied commit.
 package file
 
 import (
@@ -31,9 +35,13 @@ import (
 	"github.com/yolocs/blobster"
 )
 
-const attrsExt = ".attrs"
+const (
+	dataSubdir = "data"
+	metaSubdir = "meta"
+	tempSubdir = "tmp"
+)
 
-const tempPattern = ".blobster-tmp-*"
+const tempPattern = "w-*"
 
 type Bucket struct {
 	root   string
@@ -58,15 +66,14 @@ func (b *Bucket) Attributes(ctx context.Context, key string) (*blobster.Attribut
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	path, err := b.path(key)
+	p, err := b.paths(key)
 	if err != nil {
 		return nil, err
 	}
-	attrs, err := b.readAttributes(path)
-	if err != nil {
-		return nil, err
-	}
-	return attrs, nil
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.readAttributes(p)
 }
 
 func (b *Bucket) Close() error {
@@ -82,11 +89,11 @@ func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster
 			return err
 		}
 	}
-	srcPath, err := b.path(srcKey)
+	src, err := b.paths(srcKey)
 	if err != nil {
 		return err
 	}
-	dstPath, err := b.path(dstKey)
+	dst, err := b.paths(dstKey)
 	if err != nil {
 		return err
 	}
@@ -94,18 +101,22 @@ func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	data, err := os.ReadFile(srcPath)
+	data, err := os.ReadFile(src.data)
 	if err != nil {
 		return mapError(err, srcKey)
 	}
-	srcAttrs, err := b.readAttributes(srcPath)
+	srcAttrs, err := b.readAttributes(src)
 	if err != nil {
 		return err
 	}
 
+	now := time.Now()
 	attrs := srcAttrs.Clone()
 	attrs.Native = nil
-	return b.commit(dstPath, data, attrs)
+	attrs.CreateTime = now
+	attrs.ModTime = now
+	attrs.Version = newVersion()
+	return b.commit(dst, data, attrs)
 }
 
 func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobster.Precondition) error {
@@ -116,7 +127,7 @@ func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobst
 	if err != nil {
 		return err
 	}
-	path, err := b.path(key)
+	p, err := b.paths(key)
 	if err != nil {
 		return err
 	}
@@ -124,7 +135,7 @@ func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobst
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	current, exists, err := b.statVersion(path)
+	current, exists, err := b.statVersion(p)
 	if err != nil {
 		return err
 	}
@@ -134,10 +145,10 @@ func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobst
 	if !conditionsPass(compiled, current, true) {
 		return fmt.Errorf("%w: %s", blobster.ErrPreconditionFailed, key)
 	}
-	if err := os.Remove(path); err != nil {
+	if err := os.Remove(p.data); err != nil {
 		return mapError(err, key)
 	}
-	_ = os.Remove(path + attrsExt)
+	_ = os.Remove(p.meta)
 	return nil
 }
 
@@ -206,6 +217,9 @@ func (b *Bucket) ListPage(ctx context.Context, pageToken []byte, pageSize int, o
 		}
 	}
 
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	results, err := b.listObjects(opts)
 	if err != nil {
 		return nil, nil, err
@@ -234,18 +248,25 @@ func (b *Bucket) NewRangeReader(ctx context.Context, key string, offset, length 
 	if offset < 0 {
 		return nil, fmt.Errorf("%w: range offset cannot be negative", blobster.ErrInvalidOption)
 	}
-	path, err := b.path(key)
+	p, err := b.paths(key)
 	if err != nil {
 		return nil, err
 	}
-	attrs, err := b.readAttributes(path)
+
+	// Hold the lock only while reading committed state and opening the file
+	// descriptor; the open fd then streams independently of later renames.
+	b.mu.Lock()
+	attrs, err := b.readAttributes(p)
 	if err != nil {
+		b.mu.Unlock()
 		return nil, err
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(p.data)
+	b.mu.Unlock()
 	if err != nil {
 		return nil, mapError(err, key)
 	}
+
 	size := attrs.Size
 	if offset > size {
 		offset = size
@@ -279,14 +300,11 @@ func (b *Bucket) NewWriter(ctx context.Context, key string, opts *blobster.Write
 			return nil, err
 		}
 	}
-	path, err := b.path(key)
+	p, err := b.paths(key)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), tempPattern)
+	tmp, err := b.newTemp()
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +312,7 @@ func (b *Bucket) NewWriter(ctx context.Context, key string, opts *blobster.Write
 		ctx:           ctx,
 		bucket:        b,
 		key:           key,
-		path:          path,
+		paths:         p,
 		tmp:           tmp,
 		opts:          cloned,
 		preconditions: compiled,
@@ -370,51 +388,86 @@ func (b *Bucket) objectKey(key string) string {
 	return b.prefix + key
 }
 
-// path maps a caller key to an absolute filesystem path, rejecting keys that
-// would escape the bucket root.
-func (b *Bucket) path(key string) (string, error) {
+// objectPaths is the data and metadata file locations for one object.
+type objectPaths struct {
+	data string
+	meta string
+}
+
+// paths maps a caller key to its data and metadata file paths, rejecting keys
+// that would escape the bucket's data/meta subtrees.
+func (b *Bucket) paths(key string) (objectPaths, error) {
 	full := b.objectKey(key)
 	if full == "" {
-		return "", fmt.Errorf("%w: empty key", blobster.ErrInvalidOption)
+		return objectPaths{}, fmt.Errorf("%w: empty key", blobster.ErrInvalidOption)
 	}
-	clean := filepath.Clean(filepath.Join(b.root, filepath.FromSlash(full)))
-	rootClean := filepath.Clean(b.root)
-	if clean != rootClean && !strings.HasPrefix(clean, rootClean+string(os.PathSeparator)) {
-		return "", fmt.Errorf("%w: key escapes bucket root: %s", blobster.ErrInvalidOption, key)
+	rel := filepath.FromSlash(full)
+	data, err := securejoin(filepath.Join(b.root, dataSubdir), rel)
+	if err != nil {
+		return objectPaths{}, fmt.Errorf("%w: %s", err, key)
+	}
+	meta, err := securejoin(filepath.Join(b.root, metaSubdir), rel)
+	if err != nil {
+		return objectPaths{}, fmt.Errorf("%w: %s", err, key)
+	}
+	return objectPaths{data: data, meta: meta}, nil
+}
+
+// securejoin joins rel onto base and verifies the result stays within base.
+func securejoin(base, rel string) (string, error) {
+	clean := filepath.Clean(filepath.Join(base, rel))
+	baseClean := filepath.Clean(base)
+	if clean != baseClean && !strings.HasPrefix(clean, baseClean+string(os.PathSeparator)) {
+		return "", fmt.Errorf("%w: key escapes bucket root", blobster.ErrInvalidOption)
+	}
+	if clean == baseClean {
+		return "", fmt.Errorf("%w: key resolves to bucket root", blobster.ErrInvalidOption)
 	}
 	return clean, nil
 }
 
-// commit atomically writes data and its attributes sidecar. It must be called
-// while holding b.mu when conditional semantics matter.
-func (b *Bucket) commit(path string, data []byte, attrs *blobster.Attributes) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+func (b *Bucket) newTemp() (*os.File, error) {
+	dir := filepath.Join(b.root, tempSubdir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return os.CreateTemp(dir, tempPattern)
+}
+
+// commit atomically writes data then its metadata sidecar. Data is the source of
+// truth for existence, so it is renamed first. It must be called holding b.mu.
+func (b *Bucket) commit(p objectPaths, data []byte, attrs *blobster.Attributes) error {
+	if err := os.MkdirAll(filepath.Dir(p.data), 0o755); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(path+attrsExt, mustMarshalAttrs(attrs), filepath.Dir(path)); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p.meta), 0o755); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(path, data, filepath.Dir(path)); err != nil {
+	if err := b.writeFileAtomic(p.data, data); err != nil {
+		return err
+	}
+	if err := b.writeFileAtomic(p.meta, mustMarshalAttrs(attrs)); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (b *Bucket) readAttributes(path string) (*blobster.Attributes, error) {
-	info, err := os.Stat(path)
+func (b *Bucket) readAttributes(p objectPaths) (*blobster.Attributes, error) {
+	info, err := os.Stat(p.data)
 	if err != nil {
-		return nil, mapError(err, path)
+		return nil, mapError(err, p.data)
 	}
 	attrs := &blobster.Attributes{
 		ModTime: info.ModTime(),
 		Size:    info.Size(),
 	}
-	sidecar, err := os.ReadFile(path + attrsExt)
+	sidecar, err := os.ReadFile(p.meta)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
-		// Tolerate a data file with no sidecar (e.g. created out of band).
+		// Tolerate a data file with no sidecar (e.g. mid-commit or created out of
+		// band): derive a version from the data file so reads still work.
 		attrs.Version = deriveVersion(info)
 		return attrs, nil
 	}
@@ -431,12 +484,16 @@ func (b *Bucket) readAttributes(path string) (*blobster.Attributes, error) {
 	attrs.CreateTime = stored.CreateTime
 	attrs.MD5 = bytes.Clone(stored.MD5)
 	attrs.Version = stored.Version
+	if stored.Size > 0 || stored.Version != "" {
+		attrs.Size = stored.Size
+	}
 	return attrs, nil
 }
 
-// statVersion returns the current version token of the object at path, if any.
-func (b *Bucket) statVersion(path string) (*blobster.Attributes, bool, error) {
-	attrs, err := b.readAttributes(path)
+// statVersion returns the current committed attributes of an object, if it
+// exists. It must be called holding b.mu.
+func (b *Bucket) statVersion(p objectPaths) (*blobster.Attributes, bool, error) {
+	attrs, err := b.readAttributes(p)
 	if err != nil {
 		if errors.Is(err, blobster.ErrNotFound) {
 			return nil, false, nil
@@ -446,14 +503,17 @@ func (b *Bucket) statVersion(path string) (*blobster.Attributes, bool, error) {
 	return attrs, true, nil
 }
 
+// listObjects walks the data subtree. Caller keys live exclusively under that
+// subtree, so there is no bookkeeping state to filter out. It must be called
+// holding b.mu.
 func (b *Bucket) listObjects(opts *blobster.ListOptions) ([]*blobster.ListObject, error) {
-	rootClean := filepath.Clean(b.root)
+	dataRoot := filepath.Clean(filepath.Join(b.root, dataSubdir))
 	type entry struct {
 		key  string
 		info os.FileInfo
 	}
 	var entries []entry
-	err := filepath.Walk(rootClean, func(p string, info os.FileInfo, err error) error {
+	err := filepath.Walk(dataRoot, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
@@ -463,10 +523,7 @@ func (b *Bucket) listObjects(opts *blobster.ListOptions) ([]*blobster.ListObject
 		if info.IsDir() {
 			return nil
 		}
-		if strings.HasSuffix(info.Name(), attrsExt) || strings.HasPrefix(info.Name(), ".blobster-tmp-") {
-			return nil
-		}
-		rel, err := filepath.Rel(rootClean, p)
+		rel, err := filepath.Rel(dataRoot, p)
 		if err != nil {
 			return err
 		}
@@ -505,7 +562,10 @@ func (b *Bucket) listObjects(opts *blobster.ListOptions) ([]*blobster.ListObject
 		}
 		info := infos[fullKey]
 		var md5sum []byte
-		if attrs, err := b.readAttributes(filepath.Join(rootClean, filepath.FromSlash(fullKey))); err == nil {
+		if attrs, err := b.readAttributes(objectPaths{
+			data: filepath.Join(dataRoot, filepath.FromSlash(fullKey)),
+			meta: filepath.Join(filepath.Clean(filepath.Join(b.root, metaSubdir)), filepath.FromSlash(fullKey)),
+		}); err == nil {
 			md5sum = bytes.Clone(attrs.MD5)
 		}
 		results = append(results, &blobster.ListObject{
@@ -527,6 +587,7 @@ type storedAttrs struct {
 	ContentType        string            `json:"content_type,omitempty"`
 	Metadata           map[string]string `json:"metadata,omitempty"`
 	MD5                []byte            `json:"md5,omitempty"`
+	Size               int64             `json:"size"`
 	CreateTime         time.Time         `json:"create_time"`
 }
 
@@ -540,6 +601,7 @@ func mustMarshalAttrs(attrs *blobster.Attributes) []byte {
 		ContentType:        attrs.ContentType,
 		Metadata:           attrs.Metadata,
 		MD5:                attrs.MD5,
+		Size:               attrs.Size,
 		CreateTime:         attrs.CreateTime,
 	}
 	data, _ := json.Marshal(stored)
@@ -588,7 +650,7 @@ type writer struct {
 	ctx           context.Context
 	bucket        *Bucket
 	key           string
-	path          string
+	paths         objectPaths
 	tmp           *os.File
 	opts          *blobster.WriterOptions
 	preconditions blobster.Preconditions
@@ -628,32 +690,34 @@ func (w *writer) ReadFrom(r io.Reader) (int64, error) {
 	return n, err
 }
 
-func (w *writer) Close() error {
+func (w *writer) Close() (retErr error) {
 	if w.closed {
 		return nil
 	}
 	w.closed = true
 
-	cleanup := func() {
-		w.tmp.Close()
-		os.Remove(w.tmp.Name())
-	}
+	tmpName := w.tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(tmpName)
+		}
+	}()
 
 	if err := w.ctx.Err(); err != nil {
-		cleanup()
+		w.tmp.Close()
 		return err
 	}
 	sum := w.hash.Sum(nil)
 	if len(w.opts.ContentMD5) > 0 && !bytes.Equal(sum, w.opts.ContentMD5) {
-		cleanup()
+		w.tmp.Close()
 		return fmt.Errorf("%w: content md5 mismatch", blobster.ErrInvalidOption)
 	}
 	if err := w.tmp.Sync(); err != nil {
-		cleanup()
+		w.tmp.Close()
 		return err
 	}
 	if err := w.tmp.Close(); err != nil {
-		os.Remove(w.tmp.Name())
 		return err
 	}
 
@@ -675,22 +739,27 @@ func (w *writer) Close() error {
 	w.bucket.mu.Lock()
 	defer w.bucket.mu.Unlock()
 
-	current, exists, err := w.bucket.statVersion(w.path)
+	current, exists, err := w.bucket.statVersion(w.paths)
 	if err != nil {
-		os.Remove(w.tmp.Name())
 		return err
 	}
 	if !conditionsPass(w.preconditions, current, exists) {
-		os.Remove(w.tmp.Name())
 		return fmt.Errorf("%w: %s", blobster.ErrPreconditionFailed, w.key)
 	}
 
-	if err := writeFileAtomic(w.path+attrsExt, mustMarshalAttrs(attrs), filepath.Dir(w.path)); err != nil {
-		os.Remove(w.tmp.Name())
+	if err := os.MkdirAll(filepath.Dir(w.paths.data), 0o755); err != nil {
 		return err
 	}
-	if err := os.Rename(w.tmp.Name(), w.path); err != nil {
-		os.Remove(w.tmp.Name())
+	if err := os.MkdirAll(filepath.Dir(w.paths.meta), 0o755); err != nil {
+		return err
+	}
+	// Rename data into place first (it is the existence source of truth), then
+	// the metadata sidecar.
+	if err := os.Rename(tmpName, w.paths.data); err != nil {
+		return err
+	}
+	committed = true
+	if err := w.bucket.writeFileAtomic(w.paths.meta, mustMarshalAttrs(attrs)); err != nil {
 		return err
 	}
 	return nil
@@ -719,27 +788,30 @@ func conditionsPass(preconditions blobster.Preconditions, attrs *blobster.Attrib
 	}
 }
 
-func writeFileAtomic(path string, data []byte, dir string) error {
-	tmp, err := os.CreateTemp(dir, tempPattern)
+// writeFileAtomic writes data to a temp file in the bucket's temp dir and renames
+// it onto path. Both live under the bucket root, so the rename is atomic.
+func (b *Bucket) writeFileAtomic(path string, data []byte) error {
+	tmp, err := b.newTemp()
 	if err != nil {
 		return err
 	}
+	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		os.Remove(tmp.Name())
+		os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		os.Remove(tmp.Name())
+		os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
+		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		os.Remove(tmp.Name())
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
 		return err
 	}
 	return nil

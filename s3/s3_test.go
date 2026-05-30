@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 
@@ -136,6 +137,53 @@ func TestS3ReaderSeekEndClampsBoundedRangeToObjectRemainder(t *testing.T) {
 	if len(rest) != 0 {
 		t.Fatalf("ReadAll after SeekEnd returned %d bytes, want 0", len(rest))
 	}
+}
+
+func TestS3ReaderClampsToRangeAndZeroLength(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	// open serves the full object body regardless of the requested range; the
+	// reader must clamp reads to the requested length itself.
+	const body = "abcdefghijklmnopqrstuvwxyz"
+	open := func(ctx context.Context, key string, offset, length int64) (io.ReadCloser, *blobster.Attributes, error) {
+		return io.NopCloser(strings.NewReader(body[offset:])), &blobster.Attributes{
+			ContentType: "text/plain",
+			Size:        int64(len(body)),
+		}, nil
+	}
+
+	t.Run("bounded range clamps to length", func(t *testing.T) {
+		t.Parallel()
+		r := &s3Reader{ctx: ctx, open: open, key: "k", start: 5, length: 3}
+		if err := r.reopen(0); err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer r.Close()
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if string(got) != "fgh" {
+			t.Fatalf("ReadAll = %q, want fgh", string(got))
+		}
+	})
+
+	t.Run("zero length range yields no bytes", func(t *testing.T) {
+		t.Parallel()
+		r := &s3Reader{ctx: ctx, open: open, key: "k", start: 4, length: 0}
+		if err := r.reopen(0); err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer r.Close()
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ReadAll on zero-length range = %q, want empty", string(got))
+		}
+	})
 }
 
 func TestCopySourceEscapesKey(t *testing.T) {

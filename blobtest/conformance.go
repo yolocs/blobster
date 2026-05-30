@@ -124,6 +124,19 @@ func TestBucket(t *testing.T, newBucket BucketFactory) {
 		if diff := cmp.Diff([]byte("hij"), buf); diff != "" {
 			t.Fatalf("seeked range mismatch (-want +got):\n%s", diff)
 		}
+
+		zero, err := bucket.NewRangeReader(ctx, "letters", 4, 0, nil)
+		if err != nil {
+			t.Fatalf("NewRangeReader zero-length: %v", err)
+		}
+		defer zero.Close()
+		empty, err := io.ReadAll(zero)
+		if err != nil {
+			t.Fatalf("ReadAll zero-length range: %v", err)
+		}
+		if len(empty) != 0 {
+			t.Fatalf("zero-length range read %q, want no bytes", string(empty))
+		}
 	})
 
 	t.Run("upload download and write helpers stream through bucket API", func(t *testing.T) {

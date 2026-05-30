@@ -157,7 +157,7 @@ Mapping per backend:
 | `gcs`   | `storage.Conditions{DoesNotExist: true}` | `GenerationMatch` / `GenerationNotMatch` |
 | `azure` | `If-None-Match: *` | `If-Match` / `If-None-Match` (ETag) |
 | `mem`   | in-process compare under a lock | version compare under a lock |
-| `file`  | exclusive create (`O_CREAT|O_EXCL`) + atomic rename | version (mod-time+size or sidecar) compare + atomic rename |
+| `file`  | absence check + atomic rename, under a per-bucket lock | sidecar version-token compare + atomic rename, under a per-bucket lock |
 
 A failed precondition is the sentinel `ErrPreconditionFailed`, distinct from
 `ErrNotFound`. Conditional support is advertised as the `ConditionalWrites`
@@ -230,6 +230,22 @@ manager over an `io.Pipe`; range reads reopen a `GetObject` per seek. `Copy` is
 a server-side `CopyObject` (the base `Copy` is unconditional on every backend).
 Conditional delete uses `If-Match` (the only destination condition DeleteObject
 accepts).
+
+The `file` driver splits storage into three sibling subtrees under the bucket
+root — `data/<key>` for object bytes, `meta/<key>` for a JSON sidecar (content
+headers, user metadata, MD5, size, opaque version token), and `tmp/` for
+in-flight writes. Keeping metadata and temp files in their own trees means no
+caller key can collide with bookkeeping state, so the full string keyspace stays
+addressable (unlike a single-tree `<key>.attrs` sidecar scheme, which must
+reject or escape keys ending in the sidecar suffix). Writes stream to a temp
+file and commit under a per-bucket lock: the precondition is checked against the
+committed sidecar, the data file is renamed into place first (it is the
+existence source of truth), then the sidecar — and readers take the same lock
+while opening committed state, so a half-applied commit is never observed.
+`Copy` reads the source bytes and writes them to the destination with a fresh
+version token and create/mod time, matching `mem`/`gcs`/`s3` (and diverging from
+`gocloud.dev/blob/fileblob`, which preserves the source's metadata) so every
+object carries its own identity.
 
 ## Testing
 

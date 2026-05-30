@@ -573,6 +573,16 @@ func (r *s3Reader) Read(p []byte) (int, error) {
 	if r.closed {
 		return 0, errors.New("blobster s3: read after close")
 	}
+	// Clamp to the bytes remaining in the requested range. This bounds an empty
+	// range (e.g. length 0, or a seek to the end) to zero bytes regardless of
+	// what S3 returns, and defends against a response exceeding the upper bound.
+	remaining := r.rangeSize() - r.pos
+	if remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
 	n, err := r.reader.Read(p)
 	r.pos += int64(n)
 	return n, err
