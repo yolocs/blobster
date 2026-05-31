@@ -102,6 +102,7 @@ type Capabilities struct {
 	ListPage          bool
 	RangeRead         bool
 	SignedURL         bool
+	CrossRegionCopy   bool
 }
 
 type CopyOptions struct {
