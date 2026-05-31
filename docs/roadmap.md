@@ -58,14 +58,24 @@ pin the interface and are the test substrate everything else relies on.
   root package — there is no separate `xcopy` package, and `mem`/`file` do not
   implement it.
   - **Done:** S3 (`CopyObject` plus multipart `UploadPartCopy` above the
-    single-copy size limit, with abort-on-failure cleanup) and GCS (`rewrite`,
-    whose token loop the GCS client drives internally for any object size).
-  - **Next:** Azure (async `Copy Blob` with status polling).
-  - **Open — Azure source SAS:** a cross-account Azure source needs a short-lived
-    read SAS minted from the *source's* credential (never logged). Root
-    `CopyOptions` can't express this, so it will be an `azureblob`-package-specific
-    option (explicit source URL/SAS or a source-bucket signing policy), keeping
-    the root interface cloud-neutral. Same-account copies need no SAS.
+    single-copy size limit, with abort-on-failure cleanup), GCS (`rewrite`,
+    whose token loop the GCS client drives internally for any object size), and
+    Azure (async `Copy Blob` polled to completion, sharing one poll helper with
+    the base `Copy`).
+  - **Resolved — Azure source SAS:** a cross-account Azure source needs a
+    short-lived read SAS minted from the *source's* credential (never logged).
+    Rather than a new option, the driver mints it from the source `Bucket`'s own
+    client — which `XCopyFrom` already receives — via the same `GetSASURL` path
+    `SignedURL` uses, so minting a copy SAS and signing a URL are one capability
+    with one requirement (a Shared Key credential on the source client).
+    Same-account copies (compared by client URL host) carry no SAS; the expiry
+    defaults to one hour and is tunable with `azureblob.WithCrossAccountSASExpiry`.
+  - **Future — sign from an Entra ID / token credential:** `GetSASURL` needs a
+    Shared Key credential, so a token-credential (or SAS-only) source client can
+    sign neither a URL nor a cross-account copy SAS today. Closing this needs the
+    *user-delegation key* flow (`GetUserDelegationCredential` + the "Storage Blob
+    Delegator" role); it is a cross-cutting enhancement that would light up both
+    `SignedURL` and cross-account `XCopyFrom` at once, not an xcopy-specific one.
   - **Future opt-in — persistent / recoverable handle:** the `CopyOperation`
     handle is in-memory only by default, so a process crash loses an in-flight
     copy's outcome. A planned (not ruled-out) option is a **driver-construction

@@ -38,6 +38,7 @@ type Option func(*options)
 type options struct {
 	prefix       string
 	copyInterval time.Duration
+	sasExpiry    time.Duration
 }
 
 func WithPrefix(prefix string) Option {
@@ -54,18 +55,34 @@ func WithCopyPollInterval(d time.Duration) Option {
 	}
 }
 
+// WithCrossAccountSASExpiry overrides how long the read SAS minted for a
+// cross-account XCopyFrom source stays valid. The SAS must outlive the
+// server-side copy; the default is one hour. It has no effect on same-account
+// copies, which carry no SAS.
+func WithCrossAccountSASExpiry(d time.Duration) Option {
+	return func(opts *options) {
+		opts.sasExpiry = d
+	}
+}
+
 // New returns a Bucket backed by the container the caller-owned client points at.
 // An Azure container is the unit that maps to a blobster bucket, so the container
 // client carries both the account endpoint and the container name.
 func New(client *container.Client, optFns ...Option) *Bucket {
-	opts := options{copyInterval: 200 * time.Millisecond}
+	opts := options{copyInterval: defaultCopyPollInterval}
 	for _, opt := range optFns {
 		opt(&opts)
 	}
+	// A zero or negative interval would make the status poll loop spin without
+	// backoff, so floor it at the default.
+	if opts.copyInterval <= 0 {
+		opts.copyInterval = defaultCopyPollInterval
+	}
 	return &Bucket{
 		backend: &azureBackend{
-			client:       client,
-			copyInterval: opts.copyInterval,
+			client:    client,
+			copier:    clientCopier{client: client, interval: opts.copyInterval},
+			sasExpiry: opts.sasExpiry,
 		},
 		prefix: opts.prefix,
 	}
@@ -89,6 +106,23 @@ func (b *Bucket) Close() error {
 
 func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
 	return b.backend.Copy(ctx, b.objectKey(dstKey), b.objectKey(srcKey), opts)
+}
+
+// XCopyFrom implements blobster.CrossRegionCopier. The source must be an
+// azureblob bucket (possibly in another region/account). The copy is issued
+// against this (destination) bucket's client via Copy Blob, which authorizes the
+// source read against the destination — so a cross-account source carries a
+// short-lived read SAS minted from the source bucket's own client (see
+// sourceURL). Same-account copies need no SAS. Same- vs cross-account is
+// determined by comparing the source and destination client URL hosts, which is
+// exact for standard Azure endpoints. opts.BeforeCopy customizes the underlying
+// StartCopyFromURL.
+func (b *Bucket) XCopyFrom(ctx context.Context, dstKey string, src blobster.Bucket, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
+	srcBucket, ok := src.(*Bucket)
+	if !ok {
+		return nil, fmt.Errorf("%w: cross-region copy requires an azureblob source bucket", blobster.ErrUnsupported)
+	}
+	return b.backend.XCopyFrom(ctx, b.objectKey(dstKey), srcBucket.backend, srcBucket.objectKey(srcKey), opts)
 }
 
 func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobster.Precondition) error {
@@ -232,6 +266,7 @@ type backend interface {
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
 	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
+	XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error)
 	ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error)
 	IsAccessible(ctx context.Context) (bool, error)
 	SignedURL(ctx context.Context, key string, opts *blobster.SignedURLOptions) (string, error)
@@ -240,8 +275,9 @@ type backend interface {
 }
 
 type azureBackend struct {
-	client       *container.Client
-	copyInterval time.Duration
+	client    *container.Client
+	copier    copier
+	sasExpiry time.Duration
 }
 
 func (b *azureBackend) As(i any) bool {
@@ -366,56 +402,28 @@ func (b *azureBackend) Delete(ctx context.Context, key string, preconditions blo
 	return nil
 }
 
+// Copy Blob is asynchronous, but the base Copy contract is synchronous, so the
+// copier polls the destination's copy status to completion. The source is within
+// this same container, so its plain URL needs no SAS.
 func (b *azureBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
-	dst := b.client.NewBlobClient(escapeKey(dstKey, false))
 	srcURL := b.client.NewBlobClient(escapeKey(srcKey, false)).URL()
-	input := &blob.StartCopyFromURLOptions{}
-	if opts != nil && opts.BeforeCopy != nil {
-		if err := opts.BeforeCopy(func(i any) bool { return blobster.AssignNative(input, i) }); err != nil {
-			return err
-		}
+	return b.copier.copyBlob(ctx, dstKey, srcURL, opts)
+}
+
+func (b *azureBackend) XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
+	srcBackend, ok := src.(*azureBackend)
+	if !ok {
+		return nil, fmt.Errorf("%w: cross-region copy requires an azureblob source bucket", blobster.ErrUnsupported)
 	}
-	resp, err := dst.StartCopyFromURL(ctx, srcURL, input)
-	if err != nil {
-		return mapError(err)
+	c := crossCopy{
+		copier:      b.copier,
+		src:         srcBackend,
+		dstKey:      dstKey,
+		srcKey:      srcKey,
+		sameAccount: b.accountHost() == srcBackend.accountHost(),
+		opts:        opts,
 	}
-	// Copy Blob is asynchronous; the base Copy contract is synchronous, so poll
-	// the destination's copy status to completion. Same-account copies usually
-	// complete on the first poll.
-	if deref(resp.CopyStatus) == blob.CopyStatusTypeSuccess {
-		return nil
-	}
-	// A GetProperties failure mid-copy may be transient, so tolerate a few before
-	// giving up; bail immediately if the context is done.
-	const maxPollErrors = 3
-	pollErrors := 0
-	for {
-		props, err := dst.GetProperties(ctx, nil)
-		if err != nil {
-			pollErrors++
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if pollErrors >= maxPollErrors {
-				return mapError(err)
-			}
-			if waitErr := sleep(ctx, b.copyInterval); waitErr != nil {
-				return waitErr
-			}
-			continue
-		}
-		pollErrors = 0
-		switch deref(props.CopyStatus) {
-		case blob.CopyStatusTypeSuccess:
-			return nil
-		case blob.CopyStatusTypePending:
-			if waitErr := sleep(ctx, b.copyInterval); waitErr != nil {
-				return waitErr
-			}
-		default:
-			return fmt.Errorf("blobster azure: copy %s: status %q", deref(resp.CopyID), deref(props.CopyStatus))
-		}
-	}
+	return blobster.StartCopyOperation(ctx, c.run), nil
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -550,6 +558,7 @@ func (b *azureBackend) Capabilities() blobster.Capabilities {
 		ListPage:          true,
 		RangeRead:         true,
 		SignedURL:         true,
+		CrossRegionCopy:   true,
 	}
 }
 

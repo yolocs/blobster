@@ -210,14 +210,12 @@ type assertion per capability.
 | Base `Bucket`      |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `ConditionalWrites`|  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `MultipartUploader`|  ✅¹  |  ✅¹   | ✅   |  ✅   |  ✅     |
-| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  ✅   |  🔜³  |
+| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  ✅   |  ✅     |
 | Signed URLs        |  ❌   |  ❌    | ✅   |  ✅²  |  ✅     |
 | `Pinger`           |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 
 ¹ local (non-native) implementation — correct, but not a true server-side
-multipart. ² requires `gcs.WithSignedURLs`. ³ planned — the mechanism is verified
-(Azure async `Copy Blob`) but not yet implemented, so `azureblob` neither
-satisfies `CrossRegionCopier` nor sets `Capabilities.CrossRegionCopy` today.
+multipart. ² requires `gcs.WithSignedURLs`.
 
 `mem` and `file` deliberately do **not** implement `CrossRegionCopier`: there is
 no region to cross and no server-side transfer to orchestrate, so synthesizing
@@ -228,10 +226,11 @@ contract are unit-tested directly in the root package.
 Implemented today: base `Bucket`, conditional writes, copy, list/list-page,
 range reads for `mem`, `file`, `gcs`, `s3`, and `azureblob`; signed URLs for `gcs`
 (with `WithSignedURLs`), `s3`, and `azureblob`; cross-region copy for `s3`
-(`CopyObject` plus multipart `UploadPartCopy` above the single-copy size limit)
-and `gcs` (the `rewrite` operation, whose token loop the GCS client drives
-internally for any object size). Multipart, cross-region copy for `azureblob`,
-and pinger are planned.
+(`CopyObject` plus multipart `UploadPartCopy` above the single-copy size limit),
+`gcs` (the `rewrite` operation, whose token loop the GCS client drives internally
+for any object size), and `azureblob` (async `Copy Blob` polled to completion,
+auto-minting a source read SAS for cross-account copies). Multipart and pinger
+are planned.
 
 The `s3` driver wraps a caller-owned `*s3.Client` (`s3.New(client, bucket,
 ...)`): conditional writes map to `If-None-Match`/`If-Match` on PutObject and
@@ -309,7 +308,10 @@ blob while validated writes buffer. `Copy` is `Copy Blob`, which is
 asynchronous: the driver starts the copy and polls the destination's copy
 status to completion so the base synchronous `Copy` contract holds (same-account
 copies typically complete on the first poll; a few transient `GetProperties`
-failures during polling are tolerated before giving up). Signed URLs use the
+failures during polling are tolerated before giving up). The same poll-to-
+completion helper backs the `CrossRegionCopier` capability (`XCopyFrom`), which
+copies from a source in another container/account — see
+[Cross-region copy](#cross-region-copy). Signed URLs use the
 blob client's `GetSASURL`, which requires the container client to carry a
 shared-key credential; because `GetSASURL` signs only the path, permissions, and
 expiry, the driver returns `ErrUnsupported` when a signed URL is asked to enforce
@@ -486,7 +488,12 @@ cloud's native mechanism so bytes never round-trip through the caller:
   source bucket, so the destination credential must have read on the source (the
   source `Bucket`'s own client is unused), mirroring the S3 model. *(Implemented.)*
 - **Azure** — `Copy Blob`, which is **asynchronous**: it returns a copy id and
-  the destination's copy status is polled to completion. *(Planned.)*
+  the destination's copy status is polled to completion. The copy is issued by the
+  **destination** container's client against a source URL; a same-account source
+  uses its plain blob URL, while a cross-account source carries a short-lived read
+  SAS the driver mints from the **source** bucket's own client (see below). One
+  poll-to-completion helper backs both the base `Copy` and the cross-region path.
+  *(Implemented.)*
 
 **The capability returns immediately with an async handle.** `XCopyFrom` does not
 block; it returns a `CopyOperation` whose `Done()` channel closes when the copy
@@ -495,7 +502,7 @@ cancellation. The handle and helper (`StartCopyOperation`) live in the **root
 `blobster` package** — like the lock — because the optional interface (on the
 driver) must reference the handle type, and a driver may import only root. A
 driver runs its native copy (which may itself block, as S3's does, or poll, as
-Azure's will) inside the goroutine `StartCopyOperation` manages, so the
+Azure's does) inside the goroutine `StartCopyOperation` manages, so the
 "start-and-observe" shape is uniform across synchronous and asynchronous
 backends without per-driver channel plumbing. The `ctx` passed to `XCopyFrom`
 governs the **lifetime of the whole copy**, not just the call; cancelling it
@@ -519,17 +526,43 @@ the signature. It pays off mainly for the genuinely resumable backends, so it is
 a future opt-in rather than the default — not ruled out, just not the first cut
 (S3's atomic `CopyObject` has nothing to resume regardless).
 
-**Azure cross-account needs a source read-SAS — a deliberately contained leak.**
-Azure's `Copy Blob` authorizes against the destination, so a cross-account source
-must carry a short-lived read SAS minted from the source's own credential (the
-SAS URL is a bearer credential and must never be logged). The generic
-`CopyOptions` cannot express this — it needs the source's credential, not the
-destination's — so when the Azure driver lands, the SAS is supplied through an
-**`azureblob`-package-specific option** (an explicit source URL/SAS, or a
-source-bucket signing policy) rather than a field on root `CopyOptions`, keeping
-the root interface cloud-neutral. Same-account copies (including cross-region
-within one account) need no SAS. This is an open design point tracked in the
-roadmap.
+**Azure cross-account needs a source read-SAS — and minting it is the same
+capability as a signed URL.** Azure's `Copy Blob` authorizes the source read
+against the **destination**, so within one storage account no SAS is needed (the
+destination credential can already read the source — this covers cross-container
+and cross-region-within-one-account copies). Across storage accounts it can't, so
+the source URL must carry a short-lived read SAS minted from the **source's** own
+credential (the SAS is a bearer credential and must never be logged). The root
+`CopyOptions` can't express this — it needs the source's credential, not the
+destination's — and it doesn't have to: `XCopyFrom` already receives the source as
+a `Bucket`, so after type-asserting it to `*azureblob.Bucket` the driver mints the
+SAS from the **source bucket's own client**, via the same `GetSASURL` path
+`SignedURL` uses. No new caller option is required.
+
+A key consequence: **minting the cross-account source SAS and generating a signed
+URL are one and the same operation** — both go through `GetSASURL` and both need a
+**Shared Key credential** on the source client. So there is no bucket that can
+produce a signed URL but not a cross-account copy SAS, nor the reverse. The driver
+distinguishes same- vs cross-account by comparing the source and destination
+client URL **hosts** (a storage account is one host; this can't tell apart
+path-style emulator accounts, which is not a target). The SAS expiry must outlive
+the server-side copy; it defaults to one hour and is tunable with
+`azureblob.WithCrossAccountSASExpiry`.
+
+**Expectation on the Azure storage client.** A cross-account `XCopyFrom` requires
+the **source** bucket's `*container.Client` to hold a **Shared Key** credential
+(e.g. built via `NewClientFromConnectionString` or a shared-key credential) so it
+can self-sign the read SAS — exactly the same requirement as `SignedURL`. A source
+client built from an **Entra ID / token credential** or from a SAS cannot sign,
+and the copy fails for the same reason a signed URL would. Same-account copies and
+the **destination** client have no such requirement (the destination client only
+issues `Copy Blob`).
+
+The token-credential gap is a **future cross-cutting enhancement, not an
+xcopy-specific one**: signing from an Entra ID credential needs a *user-delegation
+key* (`GetUserDelegationCredential`, plus the "Storage Blob Delegator" RBAC role),
+which the current `SignedURL` does not implement either. Adding it would light up
+both signed URLs and cross-account copy at once; it is tracked in the roadmap.
 
 **Verified constraints** (see [`cloud-backend-research.md`](cloud-backend-research.md)):
 cross-region copy is genuinely server-side on all three, but S3's only works
