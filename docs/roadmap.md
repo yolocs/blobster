@@ -58,9 +58,9 @@ pin the interface and are the test substrate everything else relies on.
   root package — there is no separate `xcopy` package, and `mem`/`file` do not
   implement it.
   - **Done:** S3 (`CopyObject` plus multipart `UploadPartCopy` above the
-    single-copy size limit, with abort-on-failure cleanup).
-  - **Next:** GCS (`rewrite` token loop) and Azure (async `Copy Blob` with status
-    polling).
+    single-copy size limit, with abort-on-failure cleanup) and GCS (`rewrite`,
+    whose token loop the GCS client drives internally for any object size).
+  - **Next:** Azure (async `Copy Blob` with status polling).
   - **Open — Azure source SAS:** a cross-account Azure source needs a short-lived
     read SAS minted from the *source's* credential (never logged). Root
     `CopyOptions` can't express this, so it will be an `azureblob`-package-specific
