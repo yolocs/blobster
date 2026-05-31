@@ -66,12 +66,16 @@ pin the interface and are the test substrate everything else relies on.
     `CopyOptions` can't express this, so it will be an `azureblob`-package-specific
     option (explicit source URL/SAS or a source-bucket signing policy), keeping
     the root interface cloud-neutral. Same-account copies need no SAS.
-  - **Deferred — recoverable copies:** the `CopyOperation` handle is in-memory
-    only, so a process crash loses an in-flight copy's outcome. A later option is
-    to persist an operation record plus each backend's resume token (S3 multipart
-    upload-id, GCS rewrite token, Azure copy-id) under `.blobster/xcopy/` so
-    another process can re-attach. Only worthwhile for the genuinely resumable
-    backends; not built for S3's atomic `CopyObject`.
+  - **Future opt-in — persistent / recoverable handle:** the `CopyOperation`
+    handle is in-memory only by default, so a process crash loses an in-flight
+    copy's outcome. A planned (not ruled-out) option is a **driver-construction
+    choice** (e.g. `WithPersistentCopyHandle`) that persists an operation record
+    plus each backend's resume token (S3 multipart upload-id, GCS rewrite token,
+    Azure copy-id) under `.blobster/xcopy/`, so another process can re-attach,
+    recover, or re-poll. The API is shaped to keep this additive — same
+    `XCopyFrom`/`CopyOperation`, backed by bucket state instead of memory. Most
+    worthwhile for the genuinely resumable backends; the in-memory default stays
+    for the simple/synchronous cases.
 
 ### Cross-cutting
 - Signed/presigned URLs as a first-class capability (`SignedURLer`).

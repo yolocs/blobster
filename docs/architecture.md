@@ -496,14 +496,20 @@ destination may or may not exist afterward. A synchronous setup failure (e.g. th
 source is a different backend — `ErrUnsupported`) is returned directly and yields
 no handle.
 
-**The handle is in-memory only.** If the process exits while a copy is in flight,
-its outcome cannot be observed — there is no persisted record to re-attach to.
-This is an accepted limitation of the first cut; a future option is to persist an
-operation record (and each backend's resume token: S3 multipart upload-id, GCS
-rewrite token, Azure copy-id) under `.blobster/xcopy/` so another process can
-recover an in-flight copy. That only pays off for the genuinely resumable
-backends, so it is deferred to the backlog rather than built for S3's atomic
-`CopyObject`, which has nothing to resume.
+**The handle is in-memory only — for now, by construction choice.** Today, if the
+process exits while a copy is in flight, its outcome cannot be observed: there is
+no persisted record to re-attach to. This is the default and the only mode in the
+first cut, but it is deliberately *not* a dead end. The intended evolution is a
+**driver-construction option** (e.g. a `WithPersistentCopyHandle`-style option on
+the cloud driver) that opts a bucket into persisting an operation record — plus
+each backend's resume token (S3 multipart upload-id, GCS rewrite token, Azure
+copy-id) — under `.blobster/xcopy/`, so another process (or the same one after a
+restart) can recover or re-poll an in-flight copy. The current API is shaped to
+keep this purely additive: `XCopyFrom` still returns a `CopyOperation`, and the
+persistent mode would back that same handle with bucket state rather than change
+the signature. It pays off mainly for the genuinely resumable backends, so it is
+a future opt-in rather than the default — not ruled out, just not the first cut
+(S3's atomic `CopyObject` has nothing to resume regardless).
 
 **Azure cross-account needs a source read-SAS — a deliberately contained leak.**
 Azure's `Copy Blob` authorizes against the destination, so a cross-account source
