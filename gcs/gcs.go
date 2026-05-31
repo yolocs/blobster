@@ -60,9 +60,10 @@ func New(client *storage.Client, bucket string, optFns ...Option) *Bucket {
 	}
 	return &Bucket{
 		backend: &storageBackend{
-			client:  client,
-			bucket:  bucket,
-			signing: opts.signing,
+			client:   client,
+			bucket:   bucket,
+			signing:  opts.signing,
+			rewriter: clientRewriter{client: client},
 		},
 		prefix: opts.prefix,
 	}
@@ -86,6 +87,19 @@ func (b *Bucket) Close() error {
 
 func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
 	return b.backend.Copy(ctx, b.objectKey(dstKey), b.objectKey(srcKey), opts)
+}
+
+// XCopyFrom implements blobster.CrossRegionCopier. The source must be a gcs
+// bucket (possibly in another region/project/account); the rewrite is issued
+// against this (destination) bucket's client and names the source bucket, so the
+// destination client's credential must have read access to the source.
+// opts.BeforeCopy customizes the underlying storage.Copier.
+func (b *Bucket) XCopyFrom(ctx context.Context, dstKey string, src blobster.Bucket, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
+	srcBucket, ok := src.(*Bucket)
+	if !ok {
+		return nil, fmt.Errorf("%w: cross-region copy requires a gcs source bucket", blobster.ErrUnsupported)
+	}
+	return b.backend.XCopyFrom(ctx, b.objectKey(dstKey), srcBucket.backend, srcBucket.objectKey(srcKey), opts)
 }
 
 func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobster.Precondition) error {
@@ -229,6 +243,7 @@ type backend interface {
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
 	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
+	XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error)
 	ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error)
 	IsAccessible(ctx context.Context) (bool, error)
 	SignedURL(ctx context.Context, key string, opts *blobster.SignedURLOptions) (string, error)
@@ -237,9 +252,10 @@ type backend interface {
 }
 
 type storageBackend struct {
-	client  *storage.Client
-	bucket  string
-	signing *SigningOptions
+	client   *storage.Client
+	bucket   string
+	signing  *SigningOptions
+	rewriter rewriter
 }
 
 func (b *storageBackend) As(i any) bool {
@@ -327,6 +343,22 @@ func (b *storageBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *
 	}
 	_, err := copier.Run(ctx)
 	return mapError(err)
+}
+
+func (b *storageBackend) XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
+	srcBackend, ok := src.(*storageBackend)
+	if !ok {
+		return nil, fmt.Errorf("%w: cross-region copy requires a gcs source bucket", blobster.ErrUnsupported)
+	}
+	c := crossCopy{
+		rewriter:  b.rewriter,
+		dstBucket: b.bucket,
+		dstKey:    dstKey,
+		srcBucket: srcBackend.bucket,
+		srcKey:    srcKey,
+		opts:      opts,
+	}
+	return blobster.StartCopyOperation(ctx, c.run), nil
 }
 
 func (b *storageBackend) ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error) {
@@ -443,6 +475,7 @@ func (b *storageBackend) Capabilities() blobster.Capabilities {
 		ListPage:          true,
 		RangeRead:         true,
 		SignedURL:         b.signing != nil,
+		CrossRegionCopy:   true,
 	}
 }
 

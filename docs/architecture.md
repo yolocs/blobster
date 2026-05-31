@@ -210,15 +210,14 @@ type assertion per capability.
 | Base `Bucket`      |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `ConditionalWrites`|  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `MultipartUploader`|  ✅¹  |  ✅¹   | ✅   |  ✅   |  ✅     |
-| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  🔜³  |  🔜³    |
+| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  ✅   |  🔜³  |
 | Signed URLs        |  ❌   |  ❌    | ✅   |  ✅²  |  ✅     |
 | `Pinger`           |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 
 ¹ local (non-native) implementation — correct, but not a true server-side
 multipart. ² requires `gcs.WithSignedURLs`. ³ planned — the mechanism is verified
-(GCS `rewrite`, Azure async `Copy Blob`) but not yet implemented, so these
-drivers neither satisfy `CrossRegionCopier` nor set `Capabilities.CrossRegionCopy`
-today.
+(Azure async `Copy Blob`) but not yet implemented, so `azureblob` neither
+satisfies `CrossRegionCopier` nor sets `Capabilities.CrossRegionCopy` today.
 
 `mem` and `file` deliberately do **not** implement `CrossRegionCopier`: there is
 no region to cross and no server-side transfer to orchestrate, so synthesizing
@@ -229,8 +228,10 @@ contract are unit-tested directly in the root package.
 Implemented today: base `Bucket`, conditional writes, copy, list/list-page,
 range reads for `mem`, `file`, `gcs`, `s3`, and `azureblob`; signed URLs for `gcs`
 (with `WithSignedURLs`), `s3`, and `azureblob`; cross-region copy for `s3`
-(`CopyObject` plus multipart `UploadPartCopy` above the single-copy size limit).
-Multipart, cross-region copy for `gcs` and `azureblob`, and pinger are planned.
+(`CopyObject` plus multipart `UploadPartCopy` above the single-copy size limit)
+and `gcs` (the `rewrite` operation, whose token loop the GCS client drives
+internally for any object size). Multipart, cross-region copy for `azureblob`,
+and pinger are planned.
 
 The `s3` driver wraps a caller-owned `*s3.Client` (`s3.New(client, bucket,
 ...)`): conditional writes map to `If-None-Match`/`If-Match` on PutObject and
@@ -479,7 +480,11 @@ cloud's native mechanism so bytes never round-trip through the caller:
   and names the source bucket in `x-amz-copy-source`; the source `Bucket` is just
   identity, so no second client is threaded. *(Implemented.)*
 - **GCS** — the `rewrite` operation, which handles cross-region and cross-bucket
-  copies and is resumable via a rewrite token. *(Planned.)*
+  copies and is resumable via a rewrite token. The Go `storage.Copier.Run` drives
+  that token loop internally, so one call copies any object size with no manual
+  multipart path; the rewrite is issued by the destination's client and names the
+  source bucket, so the destination credential must have read on the source (the
+  source `Bucket`'s own client is unused), mirroring the S3 model. *(Implemented.)*
 - **Azure** — `Copy Blob`, which is **asynchronous**: it returns a copy id and
   the destination's copy status is polled to completion. *(Planned.)*
 
