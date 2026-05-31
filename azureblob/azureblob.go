@@ -69,9 +69,14 @@ func WithCrossAccountSASExpiry(d time.Duration) Option {
 // An Azure container is the unit that maps to a blobster bucket, so the container
 // client carries both the account endpoint and the container name.
 func New(client *container.Client, optFns ...Option) *Bucket {
-	opts := options{copyInterval: 200 * time.Millisecond}
+	opts := options{copyInterval: defaultCopyPollInterval}
 	for _, opt := range optFns {
 		opt(&opts)
+	}
+	// A zero or negative interval would make the status poll loop spin without
+	// backoff, so floor it at the default.
+	if opts.copyInterval <= 0 {
+		opts.copyInterval = defaultCopyPollInterval
 	}
 	return &Bucket{
 		backend: &azureBackend{
@@ -108,8 +113,10 @@ func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster
 // against this (destination) bucket's client via Copy Blob, which authorizes the
 // source read against the destination — so a cross-account source carries a
 // short-lived read SAS minted from the source bucket's own client (see
-// sourceURL). Same-account copies need no SAS. opts.BeforeCopy customizes the
-// underlying StartCopyFromURL.
+// sourceURL). Same-account copies need no SAS. Same- vs cross-account is
+// determined by comparing the source and destination client URL hosts, which is
+// exact for standard Azure endpoints. opts.BeforeCopy customizes the underlying
+// StartCopyFromURL.
 func (b *Bucket) XCopyFrom(ctx context.Context, dstKey string, src blobster.Bucket, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
 	srcBucket, ok := src.(*Bucket)
 	if !ok {

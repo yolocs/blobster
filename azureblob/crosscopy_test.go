@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -144,11 +145,105 @@ func TestXCopyFromCrossAccountMintsReadSAS(t *testing.T) {
 	if !strings.HasPrefix(call.srcURL, "https://srcacct.blob.core.windows.net/srccont/in.bin?") {
 		t.Fatalf("srcURL = %q, want source-account blob URL with query", call.srcURL)
 	}
-	if !strings.Contains(call.srcURL, "sig=") {
+	q := sasQuery(t, call.srcURL)
+	if q.Get("sig") == "" {
 		t.Fatalf("srcURL = %q, want a SAS signature for a cross-account copy", call.srcURL)
 	}
-	if !strings.Contains(call.srcURL, "sp=r") {
-		t.Fatalf("srcURL = %q, want read-only SAS permission (sp=r)", call.srcURL)
+	// Exactly read — not, say, sp=rw — so parse rather than substring-match.
+	if got := q.Get("sp"); got != "r" {
+		t.Fatalf("SAS permission sp = %q, want exactly \"r\"", got)
+	}
+}
+
+// sasQuery parses the query string of a SAS-bearing URL.
+func sasQuery(t *testing.T, rawURL string) url.Values {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse srcURL %q: %v", rawURL, err)
+	}
+	return u.Query()
+}
+
+// TestXCopyFromCrossAccountSASExpiry verifies the minted SAS expiry honors
+// WithCrossAccountSASExpiry, and falls back to the one-hour default otherwise.
+func TestXCopyFromCrossAccountSASExpiry(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		sasExpiry time.Duration
+		want      time.Duration
+	}{
+		{name: "explicit override", sasExpiry: 15 * time.Minute, want: 15 * time.Minute},
+		{name: "default fallback", sasExpiry: 0, want: defaultCrossAccountSASExpiry},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fc := &fakeCopier{}
+			dstBackend := newSharedKeyBackend(t, "dstacct", "dstcont")
+			srcBackend := newSharedKeyBackend(t, "srcacct", "srccont")
+			srcBackend.sasExpiry = tc.sasExpiry
+			dst, src := bucketWith(dstBackend, fc, "", srcBackend, "")
+
+			before := time.Now()
+			op, err := dst.XCopyFrom(t.Context(), "out.bin", src, "in.bin", nil)
+			if err != nil {
+				t.Fatalf("XCopyFrom: %v", err)
+			}
+			waitDone(t, op)
+			if err := op.Err(); err != nil {
+				t.Fatalf("Err: %v", err)
+			}
+
+			se := sasQuery(t, fc.lastCall(t).srcURL).Get("se")
+			if se == "" {
+				t.Fatal("SAS has no signed-expiry (se) param")
+			}
+			expiry, err := time.Parse(time.RFC3339, se)
+			if err != nil {
+				t.Fatalf("parse se %q: %v", se, err)
+			}
+			// The driver signs with time.Now()+want; allow a generous window for the
+			// time elapsed during the call.
+			lo := before.Add(tc.want).Add(-time.Minute)
+			hi := time.Now().Add(tc.want).Add(time.Minute)
+			if expiry.Before(lo) || expiry.After(hi) {
+				t.Fatalf("SAS expiry %v outside [%v, %v] for want=%v", expiry, lo, hi, tc.want)
+			}
+		})
+	}
+}
+
+// TestXCopyFromCrossAccountSourceCannotSign verifies that a cross-account source
+// whose client carries no shared-key credential fails the copy through the
+// handle — the same GetSASURL requirement as SignedURL — without ever invoking
+// the copy seam.
+func TestXCopyFromCrossAccountSourceCannotSign(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCopier{}
+	dstBackend := newSharedKeyBackend(t, "dstacct", "dstcont")
+	// A no-credential source client cannot mint a read SAS.
+	srcClient, err := container.NewClientWithNoCredential("https://srcacct.blob.core.windows.net/srccont", nil)
+	if err != nil {
+		t.Fatalf("NewClientWithNoCredential: %v", err)
+	}
+	srcBackend := &azureBackend{client: srcClient}
+	dst, src := bucketWith(dstBackend, fc, "", srcBackend, "")
+
+	op, err := dst.XCopyFrom(t.Context(), "out.bin", src, "in.bin", nil)
+	if err != nil {
+		t.Fatalf("XCopyFrom: %v", err)
+	}
+	waitDone(t, op)
+	if op.Err() == nil {
+		t.Fatal("Err = nil, want a signing failure for a no-credential source")
+	}
+	fc.mu.Lock()
+	calls := len(fc.calls)
+	fc.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("copyBlob calls = %d, want 0 (copy must not start when the source cannot sign)", calls)
 	}
 }
 
@@ -286,6 +381,25 @@ func TestPollCopyStatus(t *testing.T) {
 		t.Parallel()
 		boom := errors.New("persistent boom")
 		poller := &fakeStatusPoller{steps: []statusStep{{err: boom}}}
+		if err := pollCopyStatus(t.Context(), poller, "copy-1", time.Millisecond); !errors.Is(err, boom) {
+			t.Fatalf("pollCopyStatus err = %v, want %v", err, boom)
+		}
+	})
+
+	t.Run("tolerates more than maxPollErrors total when not consecutive", func(t *testing.T) {
+		t.Parallel()
+		boom := errors.New("final boom")
+		// Two errors, a successful (pending) poll that resets the counter, then
+		// three consecutive errors. Five errors total, but only the trailing three
+		// in a row trip the give-up threshold.
+		poller := &fakeStatusPoller{steps: []statusStep{
+			{err: errors.New("transient 1")},
+			{err: errors.New("transient 2")},
+			{status: blob.CopyStatusTypePending},
+			{err: errors.New("transient 3")},
+			{err: errors.New("transient 4")},
+			{err: boom},
+		}}
 		if err := pollCopyStatus(t.Context(), poller, "copy-1", time.Millisecond); !errors.Is(err, boom) {
 			t.Fatalf("pollCopyStatus err = %v, want %v", err, boom)
 		}

@@ -502,7 +502,7 @@ cancellation. The handle and helper (`StartCopyOperation`) live in the **root
 `blobster` package** — like the lock — because the optional interface (on the
 driver) must reference the handle type, and a driver may import only root. A
 driver runs its native copy (which may itself block, as S3's does, or poll, as
-Azure's will) inside the goroutine `StartCopyOperation` manages, so the
+Azure's does) inside the goroutine `StartCopyOperation` manages, so the
 "start-and-observe" shape is uniform across synchronous and asynchronous
 backends without per-driver channel plumbing. The `ctx` passed to `XCopyFrom`
 governs the **lifetime of the whole copy**, not just the call; cancelling it

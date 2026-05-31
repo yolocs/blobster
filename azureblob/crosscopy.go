@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -17,6 +18,9 @@ import (
 // since Azure reads the source for the copy's whole duration; callers with very
 // large cross-account copies can extend it with WithCrossAccountSASExpiry.
 const defaultCrossAccountSASExpiry = time.Hour
+
+// defaultCopyPollInterval is how often Copy Blob status is polled to completion.
+const defaultCopyPollInterval = 200 * time.Millisecond
 
 // copier performs one server-side Copy Blob of srcURL into dstKey on the
 // destination container, blocking until Azure's asynchronous copy reaches a
@@ -143,15 +147,19 @@ func (b *azureBackend) sourceURL(ctx context.Context, srcKey string, sameAccount
 	return signed, nil
 }
 
-// accountHost is the host of this backend's container client URL. Two buckets
-// share a storage account iff their hosts match; a differing host means a
-// cross-account copy, which needs a source read SAS. Host comparison cannot
-// distinguish path-style emulator accounts (all share one host), which is
-// acceptable: cross-account copy between emulator accounts is not a target.
+// accountHost is the lowercased host of this backend's container client URL. Two
+// buckets share a storage account iff their hosts match; a differing host means a
+// cross-account copy, which needs a source read SAS. Standard Azure gives every
+// account a distinct host (account.blob.core.windows.net), so this is exact for
+// real deployments. It cannot distinguish path-style accounts that share one host
+// (the Azurite emulator, some custom endpoints); there a genuinely cross-account
+// copy would be issued without a SAS and fail loudly at authorization rather than
+// mis-target. That is acceptable: cross-account copy between path-style accounts
+// is not a target.
 func (b *azureBackend) accountHost() string {
 	u, err := url.Parse(b.client.URL())
 	if err != nil {
 		return ""
 	}
-	return u.Host
+	return strings.ToLower(u.Host)
 }
