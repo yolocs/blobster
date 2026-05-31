@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ type fakeCopyAPI struct {
 
 	headSize int64
 	headErr  error
+	head     *s3.HeadObjectOutput
 
 	copyObjectInputs []*s3.CopyObjectInput
 	createInputs     []*s3.CreateMultipartUploadInput
@@ -32,12 +34,16 @@ type fakeCopyAPI struct {
 	abortInputs      []*s3.AbortMultipartUploadInput
 
 	partCopyHook func(*s3.UploadPartCopyInput) error
+	completeHook func(*s3.CompleteMultipartUploadInput) error
 	nextETag     int
 }
 
 func (f *fakeCopyAPI) HeadObject(ctx context.Context, in *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
 	if f.headErr != nil {
 		return nil, f.headErr
+	}
+	if f.head != nil {
+		return f.head, nil
 	}
 	return &s3.HeadObjectOutput{
 		ContentLength: aws.Int64(f.headSize),
@@ -75,6 +81,11 @@ func (f *fakeCopyAPI) UploadPartCopy(ctx context.Context, in *s3.UploadPartCopyI
 }
 
 func (f *fakeCopyAPI) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput, _ ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error) {
+	if f.completeHook != nil {
+		if err := f.completeHook(in); err != nil {
+			return nil, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completeInputs = append(f.completeInputs, in)
@@ -98,6 +109,7 @@ func newCrossCopy(api copyAPI, maxSingle, partSize int64) crossCopy {
 		srcKey:      "src/key",
 		maxSingle:   maxSingle,
 		partSize:    partSize,
+		maxParts:    maxCopyParts,
 		concurrency: 4,
 	}
 }
@@ -232,6 +244,245 @@ func TestCrossCopyHeadErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestCrossCopyMultipartAbortsOnCompleteError covers the second abort path: all
+// parts succeed but CompleteMultipartUpload fails, so the upload must be aborted
+// rather than left orphaned.
+func TestCrossCopyMultipartAbortsOnCompleteError(t *testing.T) {
+	t.Parallel()
+	completeErr := errors.New("complete failed")
+	api := &fakeCopyAPI{
+		headSize:     12,
+		completeHook: func(*s3.CompleteMultipartUploadInput) error { return completeErr },
+	}
+	c := newCrossCopy(api, 4, 4)
+
+	err := c.run(t.Context())
+	if !errors.Is(err, completeErr) {
+		t.Fatalf("run err = %v, want %v", err, completeErr)
+	}
+	// All parts were copied before Complete was attempted.
+	if len(api.partCopyInputs) != 3 {
+		t.Fatalf("UploadPartCopy calls = %d, want 3", len(api.partCopyInputs))
+	}
+	if len(api.abortInputs) != 1 {
+		t.Fatalf("abort calls = %d, want 1", len(api.abortInputs))
+	}
+	if got := aws.ToString(api.abortInputs[0].UploadId); got != "upload-1" {
+		t.Fatalf("aborted upload id = %q, want upload-1", got)
+	}
+}
+
+// TestCrossCopyMultipartCapsPartCount drives the partSize-recalculation branch:
+// with the default part size the object would need more than maxParts parts, so
+// the copy must grow the part size until the count fits, and the ranges must
+// still tile the whole object with no gaps or overlap.
+func TestCrossCopyMultipartCapsPartCount(t *testing.T) {
+	t.Parallel()
+	const size = 40
+	api := &fakeCopyAPI{headSize: size}
+	c := newCrossCopy(api, 4, 4) // partSize 4 -> 10 parts naively
+	c.maxParts = 3               // force recalculation: 40 over 3 parts
+
+	if err := c.run(t.Context()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := len(api.partCopyInputs); got > c.maxParts {
+		t.Fatalf("part count = %d, want <= maxParts %d", got, c.maxParts)
+	}
+
+	// The ranges must cover [0,size) exactly once, in order, with no hole.
+	type span struct{ start, end int64 }
+	spans := make([]span, 0, len(api.partCopyInputs))
+	for _, in := range api.partCopyInputs {
+		var s span
+		if _, err := fmt.Sscanf(aws.ToString(in.CopySourceRange), "bytes=%d-%d", &s.start, &s.end); err != nil {
+			t.Fatalf("parse range %q: %v", aws.ToString(in.CopySourceRange), err)
+		}
+		spans = append(spans, s)
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	var next int64
+	for i, s := range spans {
+		if s.start != next {
+			t.Fatalf("span[%d] starts at %d, want %d (gap or overlap)", i, s.start, next)
+		}
+		if s.end < s.start {
+			t.Fatalf("span[%d] is empty: %d-%d", i, s.start, s.end)
+		}
+		next = s.end + 1
+	}
+	if next != size {
+		t.Fatalf("ranges cover up to %d, want %d", next, size)
+	}
+}
+
+// TestCrossCopyMultipartBoundsConcurrency proves SetLimit actually caps the
+// number of in-flight UploadPartCopy calls; a regression dropping the limit
+// would otherwise pass every other test.
+func TestCrossCopyMultipartBoundsConcurrency(t *testing.T) {
+	t.Parallel()
+	const limit = 2
+	var inFlight, maxSeen atomic.Int64
+	release := make(chan struct{})
+	var once sync.Once
+
+	api := &fakeCopyAPI{
+		headSize: 24, // partSize 4 -> 6 parts, more than the limit
+		partCopyHook: func(*s3.UploadPartCopyInput) error {
+			cur := inFlight.Add(1)
+			for {
+				m := maxSeen.Load()
+				if cur <= m || maxSeen.CompareAndSwap(m, cur) {
+					break
+				}
+			}
+			// Park until enough parts are confirmed concurrently in flight, so the
+			// high-water mark reflects the real ceiling without time-based sleeps.
+			if cur >= limit {
+				once.Do(func() { close(release) })
+			}
+			<-release
+			inFlight.Add(-1)
+			return nil
+		},
+	}
+	c := newCrossCopy(api, 4, 4)
+	c.concurrency = limit
+
+	if err := c.run(t.Context()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := maxSeen.Load(); got > limit {
+		t.Fatalf("max in-flight UploadPartCopy = %d, want <= %d", got, limit)
+	}
+}
+
+// TestCrossCopyMultipartMirrorsHeadMetadata verifies every content header and
+// the user metadata are copied from the source head onto the destination's
+// CreateMultipartUpload, and that metadata is cloned (not aliased).
+func TestCrossCopyMultipartMirrorsHeadMetadata(t *testing.T) {
+	t.Parallel()
+	meta := map[string]string{"team": "blobster"}
+	api := &fakeCopyAPI{
+		head: &s3.HeadObjectOutput{
+			ContentLength:      aws.Int64(8),
+			CacheControl:       aws.String("max-age=60"),
+			ContentDisposition: aws.String("inline"),
+			ContentEncoding:    aws.String("gzip"),
+			ContentLanguage:    aws.String("en"),
+			ContentType:        aws.String("application/json"),
+			Metadata:           meta,
+		},
+	}
+	c := newCrossCopy(api, 4, 4)
+
+	if err := c.run(t.Context()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(api.createInputs) != 1 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 1", len(api.createInputs))
+	}
+	got := api.createInputs[0]
+	fields := map[string]struct{ got, want string }{
+		"CacheControl":       {aws.ToString(got.CacheControl), "max-age=60"},
+		"ContentDisposition": {aws.ToString(got.ContentDisposition), "inline"},
+		"ContentEncoding":    {aws.ToString(got.ContentEncoding), "gzip"},
+		"ContentLanguage":    {aws.ToString(got.ContentLanguage), "en"},
+		"ContentType":        {aws.ToString(got.ContentType), "application/json"},
+	}
+	for name, f := range fields {
+		if f.got != f.want {
+			t.Errorf("create %s = %q, want %q", name, f.got, f.want)
+		}
+	}
+	if diff := cmp.Diff(map[string]string{"team": "blobster"}, got.Metadata); diff != "" {
+		t.Fatalf("create Metadata mismatch (-want +got):\n%s", diff)
+	}
+	// Mutating the source head map must not alter the recorded create input.
+	meta["team"] = "mutated"
+	if got.Metadata["team"] != "blobster" {
+		t.Fatal("destination metadata aliases the source head map")
+	}
+}
+
+// TestCrossCopyMultipartSkipsEmptyHeadFields confirms the empty-string guards in
+// applyHeadMetadata leave unset destination fields nil rather than sending empty
+// headers.
+func TestCrossCopyMultipartSkipsEmptyHeadFields(t *testing.T) {
+	t.Parallel()
+	api := &fakeCopyAPI{
+		head: &s3.HeadObjectOutput{ContentLength: aws.Int64(8)},
+	}
+	c := newCrossCopy(api, 4, 4)
+
+	if err := c.run(t.Context()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := api.createInputs[0]
+	if got.CacheControl != nil || got.ContentDisposition != nil || got.ContentEncoding != nil ||
+		got.ContentLanguage != nil || got.ContentType != nil || got.Metadata != nil {
+		t.Fatalf("empty head fields produced non-nil create fields: %#v", got)
+	}
+}
+
+// TestCrossCopyMultipartIgnoresBeforeCopy documents and guards the asymmetry that
+// BeforeCopy applies only to the single CopyObject path, never multipart.
+func TestCrossCopyMultipartIgnoresBeforeCopy(t *testing.T) {
+	t.Parallel()
+	api := &fakeCopyAPI{headSize: 8} // > maxSingle 4 -> multipart
+	c := newCrossCopy(api, 4, 4)
+	c.opts = &blobster.CopyOptions{
+		BeforeCopy: func(func(any) bool) error {
+			t.Error("BeforeCopy was invoked on the multipart path")
+			return errors.New("should not run")
+		},
+	}
+
+	if err := c.run(t.Context()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+// TestCrossCopyMultipartAbortSurvivesCancel proves the detached abort still fires
+// (and completes) when the copy's own context is cancelled mid-flight — the
+// background cleanup must not be cancelled along with the copy.
+func TestCrossCopyMultipartAbortSurvivesCancel(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+
+	parked := make(chan struct{})
+	var once sync.Once
+	api := &fakeCopyAPI{
+		headSize: 12,
+		partCopyHook: func(*s3.UploadPartCopyInput) error {
+			once.Do(func() { close(parked) })
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	c := newCrossCopy(api, 4, 4)
+
+	errc := make(chan error, 1)
+	go func() { errc <- c.run(ctx) }()
+
+	<-parked
+	cancel()
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return after cancellation")
+	}
+	// The abort ran on its own bounded context, not the cancelled one, so it was
+	// still issued.
+	if len(api.abortInputs) != 1 {
+		t.Fatalf("abort calls = %d, want 1 (abort must survive copy cancellation)", len(api.abortInputs))
+	}
+}
+
 // TestXCopyFromResolvesPrefixes verifies XCopyFrom glues the source and
 // destination bucket prefixes into the physical CopySource and destination key,
 // end to end through the *Bucket and backend, using the injectable copy API.
@@ -271,5 +522,35 @@ func TestXCopyFromRejectsNonS3Source(t *testing.T) {
 	_, err := dst.XCopyFrom(t.Context(), "out.bin", mem.New(), "in.bin", nil)
 	if !errors.Is(err, blobster.ErrUnsupported) {
 		t.Fatalf("err = %v, want ErrUnsupported", err)
+	}
+}
+
+// TestXCopyFromComposesSubPrefixes verifies a Sub() source and destination
+// compose their prefixes into the resolved CopySource and destination key, so
+// re-rooted buckets copy between subtrees correctly.
+func TestXCopyFromComposesSubPrefixes(t *testing.T) {
+	t.Parallel()
+	api := &fakeCopyAPI{headSize: 4}
+	dst := newWithBackend(&s3Backend{copyAPI: api, bucket: "dst-bucket"}, "dstroot/").Sub("nested/")
+	src := newWithBackend(&s3Backend{copyAPI: api, bucket: "src-bucket"}, "srcroot/").Sub("deep/")
+
+	copier, ok := dst.(blobster.CrossRegionCopier)
+	if !ok {
+		t.Fatal("Sub() destination does not implement CrossRegionCopier")
+	}
+	op, err := copier.XCopyFrom(t.Context(), "out.bin", src, "in.bin", nil)
+	if err != nil {
+		t.Fatalf("XCopyFrom: %v", err)
+	}
+	<-op.Done()
+	if err := op.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	in := api.copyObjectInputs[0]
+	if got := aws.ToString(in.Key); got != "dstroot/nested/out.bin" {
+		t.Fatalf("destination key = %q, want dstroot/nested/out.bin", got)
+	}
+	if got, want := aws.ToString(in.CopySource), "src-bucket/srcroot/deep/in.bin"; got != want {
+		t.Fatalf("CopySource = %q, want %q", got, want)
 	}
 }

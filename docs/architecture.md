@@ -210,12 +210,15 @@ type assertion per capability.
 | Base `Bucket`      |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `ConditionalWrites`|  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `MultipartUploader`|  ✅¹  |  ✅¹   | ✅   |  ✅   |  ✅     |
-| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  ✅   |  ✅     |
+| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  🔜³  |  🔜³    |
 | Signed URLs        |  ❌   |  ❌    | ✅   |  ✅²  |  ✅     |
 | `Pinger`           |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 
 ¹ local (non-native) implementation — correct, but not a true server-side
-multipart. ² requires `gcs.WithSignedURLs`.
+multipart. ² requires `gcs.WithSignedURLs`. ³ planned — the mechanism is verified
+(GCS `rewrite`, Azure async `Copy Blob`) but not yet implemented, so these
+drivers neither satisfy `CrossRegionCopier` nor set `Capabilities.CrossRegionCopy`
+today.
 
 `mem` and `file` deliberately do **not** implement `CrossRegionCopier`: there is
 no region to cross and no server-side transfer to orchestrate, so synthesizing

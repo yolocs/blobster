@@ -3,6 +3,7 @@ package s3
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -22,6 +23,9 @@ const (
 	crossCopyConcurrency = 8
 	// maxCopyParts is S3's per-upload part ceiling.
 	maxCopyParts = 10000
+	// abortTimeout bounds the best-effort multipart cleanup so a detached abort
+	// against an unresponsive endpoint cannot block the copy from completing.
+	abortTimeout = 30 * time.Second
 )
 
 // copyAPI is the subset of *s3.Client the cross-region copy path uses. It exists
@@ -48,6 +52,7 @@ type crossCopy struct {
 	opts        *blobster.CopyOptions
 	maxSingle   int64
 	partSize    int64
+	maxParts    int
 	concurrency int
 }
 
@@ -92,9 +97,10 @@ func (c crossCopy) single(ctx context.Context) error {
 // destination. Any failure or cancellation aborts the upload so no parts are
 // orphaned.
 func (c crossCopy) multipart(ctx context.Context, head *s3.HeadObjectOutput, size int64) error {
+	maxParts := int64(c.maxParts)
 	partSize := c.partSize
-	if (size+partSize-1)/partSize > maxCopyParts {
-		partSize = (size + maxCopyParts - 1) / maxCopyParts
+	if (size+partSize-1)/partSize > maxParts {
+		partSize = (size + maxParts - 1) / maxParts
 	}
 	partCount := int((size + partSize - 1) / partSize)
 
@@ -156,11 +162,15 @@ func (c crossCopy) multipart(ctx context.Context, head *s3.HeadObjectOutput, siz
 	return nil
 }
 
-// abort releases an incomplete multipart upload. It runs on a background context
-// so a cancelled copy still frees its parts (which otherwise accrue storage cost
-// until a lifecycle rule reaps them); the cleanup itself is best-effort.
+// abort releases an incomplete multipart upload. It runs on a fresh bounded
+// context, detached from the copy's (possibly already-cancelled) context, so a
+// cancelled copy still frees its parts (which otherwise accrue storage cost until
+// a lifecycle rule reaps them) without letting an unresponsive endpoint block the
+// copy from reaching its terminal state. The cleanup itself is best-effort.
 func (c crossCopy) abort(uploadID *string) {
-	_, _ = c.api.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+	ctx, cancel := context.WithTimeout(context.Background(), abortTimeout)
+	defer cancel()
+	_, _ = c.api.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(c.dstBucket),
 		Key:      aws.String(c.dstKey),
 		UploadId: uploadID,

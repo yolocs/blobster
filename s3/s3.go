@@ -440,6 +440,7 @@ func (b *s3Backend) XCopyFrom(ctx context.Context, dstKey string, src backend, s
 		opts:        opts,
 		maxSingle:   maxSingleCopySize,
 		partSize:    crossCopyPartSize,
+		maxParts:    maxCopyParts,
 		concurrency: crossCopyConcurrency,
 	}
 	return blobster.StartCopyOperation(ctx, c.run), nil
