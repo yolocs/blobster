@@ -53,6 +53,7 @@ func New(client *s3.Client, bucket string, optFns ...Option) *Bucket {
 	return &Bucket{
 		backend: &s3Backend{
 			client:    client,
+			copyAPI:   client,
 			bucket:    bucket,
 			uploader:  manager.NewUploader(client),
 			presigner: s3.NewPresignClient(client),
@@ -79,6 +80,20 @@ func (b *Bucket) Close() error {
 
 func (b *Bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error {
 	return b.backend.Copy(ctx, b.objectKey(dstKey), b.objectKey(srcKey), opts)
+}
+
+// XCopyFrom implements blobster.CrossRegionCopier. The source must be an s3
+// bucket (possibly in another region/account); the copy is issued against this
+// (destination) bucket's client and names the source bucket. opts.BeforeCopy
+// customizes the underlying CopyObject for objects within S3's single-copy size
+// limit; larger objects are copied with multipart UploadPartCopy, where
+// BeforeCopy does not apply.
+func (b *Bucket) XCopyFrom(ctx context.Context, dstKey string, src blobster.Bucket, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
+	srcBucket, ok := src.(*Bucket)
+	if !ok {
+		return nil, fmt.Errorf("%w: cross-region copy requires an s3 source bucket", blobster.ErrUnsupported)
+	}
+	return b.backend.XCopyFrom(ctx, b.objectKey(dstKey), srcBucket.backend, srcBucket.objectKey(srcKey), opts)
 }
 
 func (b *Bucket) Delete(ctx context.Context, key string, preconditions ...blobster.Precondition) error {
@@ -222,6 +237,7 @@ type backend interface {
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
 	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
+	XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error)
 	ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error)
 	IsAccessible(ctx context.Context) (bool, error)
 	SignedURL(ctx context.Context, key string, opts *blobster.SignedURLOptions) (string, error)
@@ -231,6 +247,7 @@ type backend interface {
 
 type s3Backend struct {
 	client    *s3.Client
+	copyAPI   copyAPI
 	bucket    string
 	uploader  *manager.Uploader
 	presigner *s3.PresignClient
@@ -408,6 +425,26 @@ func (b *s3Backend) Copy(ctx context.Context, dstKey, srcKey string, opts *blobs
 	return nil
 }
 
+func (b *s3Backend) XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
+	srcBackend, ok := src.(*s3Backend)
+	if !ok {
+		return nil, fmt.Errorf("%w: cross-region copy requires an s3 source bucket", blobster.ErrUnsupported)
+	}
+	c := crossCopy{
+		api:         b.copyAPI,
+		dstBucket:   b.bucket,
+		dstKey:      dstKey,
+		copySource:  copySource(srcBackend.bucket, srcKey),
+		srcBucket:   srcBackend.bucket,
+		srcKey:      srcKey,
+		opts:        opts,
+		maxSingle:   maxSingleCopySize,
+		partSize:    crossCopyPartSize,
+		concurrency: crossCopyConcurrency,
+	}
+	return blobster.StartCopyOperation(ctx, c.run), nil
+}
+
 func (b *s3Backend) ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error) {
 	if len(pageToken) == 0 {
 		return nil, nil, io.EOF
@@ -539,6 +576,7 @@ func (b *s3Backend) Capabilities() blobster.Capabilities {
 		ListPage:          true,
 		RangeRead:         true,
 		SignedURL:         true,
+		CrossRegionCopy:   true,
 	}
 }
 

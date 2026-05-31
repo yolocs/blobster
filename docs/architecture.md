@@ -9,8 +9,9 @@ GitHub issues.
 
 This describes both the implemented foundation and the **target** architecture.
 The base `Bucket` API, shared conformance tests, and the `mem`, `file`, `gcs`,
-`s3`, and `azureblob` drivers are implemented. The higher-level utilities are
-planned. The **backend API facts** the design depends on —
+`s3`, and `azureblob` drivers are implemented, as are the lease lock and S3
+cross-region copy. The remaining higher-level utilities are planned. The
+**backend API facts** the design depends on —
 conditional writes, cross-region copy, multipart — are verified against the
 providers' docs and Go SDKs; the evidence and exact API surfaces live in
 [`cloud-backend-research.md`](cloud-backend-research.md).
@@ -209,19 +210,24 @@ type assertion per capability.
 | Base `Bucket`      |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `ConditionalWrites`|  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 | `MultipartUploader`|  ✅¹  |  ✅¹   | ✅   |  ✅   |  ✅     |
-| `CrossRegionCopier`|  ✅²  |  ✅²   | ✅   |  ✅   |  ✅     |
-| Signed URLs        |  ❌   |  ❌    | ✅   |  ✅³  |  ✅     |
+| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  ✅   |  ✅     |
+| Signed URLs        |  ❌   |  ❌    | ✅   |  ✅²  |  ✅     |
 | `Pinger`           |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
 
 ¹ local (non-native) implementation — correct, but not a true server-side
-multipart. ² intra-process / intra-host copy between two blobster buckets; there
-is no "region" to cross, but the interface is satisfied for uniform testing.
-³ requires `gcs.WithSignedURLs`.
+multipart. ² requires `gcs.WithSignedURLs`.
+
+`mem` and `file` deliberately do **not** implement `CrossRegionCopier`: there is
+no region to cross and no server-side transfer to orchestrate, so synthesizing
+one would add a code path the cloud drivers never share. Cross-region copy is the
+one optional capability with no `mem`/`file` stand-in; its handle and async
+contract are unit-tested directly in the root package.
 
 Implemented today: base `Bucket`, conditional writes, copy, list/list-page,
 range reads for `mem`, `file`, `gcs`, `s3`, and `azureblob`; signed URLs for `gcs`
-(with `WithSignedURLs`), `s3`, and `azureblob`. Multipart, cross-region copy, and
-pinger are planned.
+(with `WithSignedURLs`), `s3`, and `azureblob`; cross-region copy for `s3`
+(`CopyObject` plus multipart `UploadPartCopy` above the single-copy size limit).
+Multipart, cross-region copy for `gcs` and `azureblob`, and pinger are planned.
 
 The `s3` driver wraps a caller-owned `*s3.Client` (`s3.New(client, bucket,
 ...)`): conditional writes map to `If-None-Match`/`If-Match` on PutObject and
@@ -348,7 +354,7 @@ A lock is a **generic lease algorithm over one conditional-write primitive**,
 not per-driver code. The lock lives in the **root `blobster` package** (it is a
 core coordination primitive and depends only on the root contract, so it is
 surfaced at the top level rather than in its own folder, unlike the heavier,
-capability-gated `multipart`/`xcopy` utilities). A `Locker` is constructed with
+capability-gated `multipart` utility). A `Locker` is constructed with
 `blobster.NewLocker(bucket, …)` over any `blobster.Bucket` that advertises
 `ConditionalWrites`, so a caller builds a native client once and uses the same
 driver for both blob operations and locking. Internally the lease logic needs
@@ -457,22 +463,59 @@ mechanisms and limits are in
 
 ## Cross-region copy
 
-The `xcopy` package orchestrates copies via the `CrossRegionCopier` capability,
-using each cloud's native server-side mechanism so bytes never round-trip
-through the caller:
+Cross-region copy is an **optional capability on the driver**, not a separate
+orchestration package. A backend that can copy server-side to another
+region/bucket/account implements `CrossRegionCopier.XCopyFrom`, which takes the
+**destination key, a separate source `Bucket`, and the source key**, and uses the
+cloud's native mechanism so bytes never round-trip through the caller:
 
-- **S3** — `CopyObject` for objects within the size limit; `UploadPartCopy`
-  (multipart copy) for larger objects. Cross-region/cross-account copies name
-  the source bucket explicitly.
+- **S3** — `CopyObject` for objects within S3's single-copy size limit (5 GiB);
+  multipart `UploadPartCopy` (concurrent ranged part-copies, source metadata
+  mirrored onto the destination, abort on any failure or cancellation) for
+  larger objects. The copy is issued against the **destination** bucket's client
+  and names the source bucket in `x-amz-copy-source`; the source `Bucket` is just
+  identity, so no second client is threaded. *(Implemented.)*
 - **GCS** — the `rewrite` operation, which handles cross-region and cross-bucket
-  copies and is resumable via a rewrite token.
+  copies and is resumable via a rewrite token. *(Planned.)*
 - **Azure** — `Copy Blob`, which is **asynchronous**: it returns a copy id and
-  the destination's copy status is polled to completion.
+  the destination's copy status is polled to completion. *(Planned.)*
 
-Because some backends copy synchronously and others asynchronously, the API
-returns a `CopyOperation` handle with `Wait(ctx)` / `Poll(ctx)`; a synchronous
-backend returns an already-complete handle. Cancellation propagates to the
-underlying operation where the backend supports it.
+**The capability returns immediately with an async handle.** `XCopyFrom` does not
+block; it returns a `CopyOperation` whose `Done()` channel closes when the copy
+reaches a terminal state and whose `Err()` then reports success, failure, or
+cancellation. The handle and helper (`StartCopyOperation`) live in the **root
+`blobster` package** — like the lock — because the optional interface (on the
+driver) must reference the handle type, and a driver may import only root. A
+driver runs its native copy (which may itself block, as S3's does, or poll, as
+Azure's will) inside the goroutine `StartCopyOperation` manages, so the
+"start-and-observe" shape is uniform across synchronous and asynchronous
+backends without per-driver channel plumbing. The `ctx` passed to `XCopyFrom`
+governs the **lifetime of the whole copy**, not just the call; cancelling it
+requests best-effort cancellation, and because the transfer is server-side the
+destination may or may not exist afterward. A synchronous setup failure (e.g. the
+source is a different backend — `ErrUnsupported`) is returned directly and yields
+no handle.
+
+**The handle is in-memory only.** If the process exits while a copy is in flight,
+its outcome cannot be observed — there is no persisted record to re-attach to.
+This is an accepted limitation of the first cut; a future option is to persist an
+operation record (and each backend's resume token: S3 multipart upload-id, GCS
+rewrite token, Azure copy-id) under `.blobster/xcopy/` so another process can
+recover an in-flight copy. That only pays off for the genuinely resumable
+backends, so it is deferred to the backlog rather than built for S3's atomic
+`CopyObject`, which has nothing to resume.
+
+**Azure cross-account needs a source read-SAS — a deliberately contained leak.**
+Azure's `Copy Blob` authorizes against the destination, so a cross-account source
+must carry a short-lived read SAS minted from the source's own credential (the
+SAS URL is a bearer credential and must never be logged). The generic
+`CopyOptions` cannot express this — it needs the source's credential, not the
+destination's — so when the Azure driver lands, the SAS is supplied through an
+**`azureblob`-package-specific option** (an explicit source URL/SAS, or a
+source-bucket signing policy) rather than a field on root `CopyOptions`, keeping
+the root interface cloud-neutral. Same-account copies (including cross-region
+within one account) need no SAS. This is an open design point tracked in the
+roadmap.
 
 **Verified constraints** (see [`cloud-backend-research.md`](cloud-backend-research.md)):
 cross-region copy is genuinely server-side on all three, but S3's only works
@@ -494,9 +537,10 @@ root package rather than its own folder.
 ```
 blobster/            ← root package: Bucket + optional capability interfaces,
                        Attributes, Precondition/conditions, errors, Capabilities,
-                       and the lease lock (Locker, Lock, NewLocker over a Bucket)
+                       the lease lock (Locker, Lock, NewLocker over a Bucket), and
+                       the cross-region copy handle (CopyOperation,
+                       StartCopyOperation) backing the CrossRegionCopier capability
 multipart/           ← parallel-upload helper over MultipartUploader
-xcopy/               ← cross-region copy orchestration (Wait/Poll) over CrossRegionCopier
 mem/                 ← in-memory driver (reference implementation + test substrate)
 file/                ← filesystem driver (local integration + small deployments)
 s3/                  ← AWS S3 driver (wraps a caller-owned *s3.Client)
@@ -514,12 +558,12 @@ README.md  LICENSE  go.mod  Makefile
 ### Dependency rule
 
 ```
-              ┌──────── multipart/ ───────┐
-              │           xcopy/          │  (utilities: depend on root interfaces only)
-              ▼                           ▼
-        blobster (root: interfaces + types + lease lock)
-              ▲                           ▲
-              │                           │
+                     multipart/             (utility: depends on root interfaces only)
+                         │
+                         ▼
+        blobster (root: interfaces + types + lease lock + cross-region copy handle)
+                         ▲
+                         │
    mem/ file/ s3/ gcs/ azureblob/  (drivers: implement root interfaces; import only root)
 ```
 
@@ -527,9 +571,11 @@ README.md  LICENSE  go.mod  Makefile
 - The lease lock lives in the root package; it depends only on the root
   contract (no driver imports), so surfacing it at the top level keeps the
   dependency graph one-directional.
-- Utility packages (`multipart`, `xcopy`) depend on the root
-  **interfaces**, never on a concrete driver — so they work against any backend
-  that advertises the needed capability.
+- The `multipart` utility package depends on the root **interfaces**, never on a
+  concrete driver — so it works against any backend that advertises the needed
+  capability. Cross-region copy is not a utility package: its capability
+  (`CrossRegionCopier`) is implemented directly on each cloud driver and its
+  handle (`CopyOperation`) lives in root, mirroring the lock.
 - No driver imports another driver. The arrows point one way.
 
 ## Reserved keys and the root prefix

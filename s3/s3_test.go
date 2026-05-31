@@ -235,6 +235,10 @@ func (b *fakeBackend) Copy(ctx context.Context, dstKey, srcKey string, opts *blo
 	return b.bucket.Copy(ctx, dstKey, srcKey, opts)
 }
 
+func (b *fakeBackend) XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error) {
+	return nil, blobster.ErrUnsupported
+}
+
 func (b *fakeBackend) ListPage(ctx context.Context, pageToken []byte, pageSize int, opts *blobster.ListOptions) ([]*blobster.ListObject, []byte, error) {
 	return b.bucket.ListPage(ctx, pageToken, pageSize, opts)
 }

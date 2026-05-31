@@ -52,9 +52,26 @@ pin the interface and are the test substrate everything else relies on.
 - Tunable part size and concurrency; sensible per-backend defaults.
 
 ### Cross-region copy
-- `xcopy` orchestration over `CrossRegionCopier` with a uniform `CopyOperation`
-  handle (`Wait`/`Poll`) spanning synchronous (S3/GCS) and asynchronous (Azure)
-  backends.
+- `CrossRegionCopier` capability on each cloud driver, returning a uniform,
+  async `CopyOperation` handle (`Done()`/`Err()`, created via the root
+  `StartCopyOperation`). The capability lives on the driver and the handle in the
+  root package — there is no separate `xcopy` package, and `mem`/`file` do not
+  implement it.
+  - **Done:** S3 (`CopyObject` plus multipart `UploadPartCopy` above the
+    single-copy size limit, with abort-on-failure cleanup).
+  - **Next:** GCS (`rewrite` token loop) and Azure (async `Copy Blob` with status
+    polling).
+  - **Open — Azure source SAS:** a cross-account Azure source needs a short-lived
+    read SAS minted from the *source's* credential (never logged). Root
+    `CopyOptions` can't express this, so it will be an `azureblob`-package-specific
+    option (explicit source URL/SAS or a source-bucket signing policy), keeping
+    the root interface cloud-neutral. Same-account copies need no SAS.
+  - **Deferred — recoverable copies:** the `CopyOperation` handle is in-memory
+    only, so a process crash loses an in-flight copy's outcome. A later option is
+    to persist an operation record plus each backend's resume token (S3 multipart
+    upload-id, GCS rewrite token, Azure copy-id) under `.blobster/xcopy/` so
+    another process can re-attach. Only worthwhile for the genuinely resumable
+    backends; not built for S3's atomic `CopyObject`.
 
 ### Cross-cutting
 - Signed/presigned URLs as a first-class capability (`SignedURLer`).

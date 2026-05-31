@@ -97,6 +97,83 @@ func TestCloudBucketR2(t *testing.T) {
 	})
 }
 
+// TestCloudCrossRegionCopy exercises the real CrossRegionCopier path: it writes
+// a source object and copies it server-side into a destination via XCopyFrom,
+// then verifies the bytes landed. By default source and destination are the same
+// bucket (different prefixes), which still drives CopyObject and the async
+// handle; set BLOBSTER_S3_XCOPY_DEST_BUCKET (and optionally
+// BLOBSTER_S3_XCOPY_DEST_REGION) to make it a genuine cross-region copy. The
+// multipart UploadPartCopy path is covered by unit tests, since a >5 GiB object
+// is impractical here.
+func TestCloudCrossRegionCopy(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	bucketName := os.Getenv("BLOBSTER_S3_BUCKET")
+	if bucketName == "" {
+		t.Skip("set BLOBSTER_S3_BUCKET to run cloud S3 integration tests")
+	}
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		t.Fatalf("LoadDefaultConfig: %v", err)
+	}
+	client := awss3.NewFromConfig(cfg)
+
+	destBucket := os.Getenv("BLOBSTER_S3_XCOPY_DEST_BUCKET")
+	destClient := client
+	if destBucket == "" {
+		destBucket = bucketName
+	} else if region := os.Getenv("BLOBSTER_S3_XCOPY_DEST_REGION"); region != "" {
+		destClient = awss3.NewFromConfig(cfg, func(o *awss3.Options) { o.Region = region })
+	}
+
+	basePrefix := os.Getenv("BLOBSTER_S3_PREFIX")
+	if basePrefix != "" && !strings.HasSuffix(basePrefix, "/") {
+		basePrefix += "/"
+	}
+	prefix := fmt.Sprintf("%sblobster-xcopy-%d/", basePrefix, time.Now().UnixNano())
+	t.Cleanup(func() {
+		cleanupS3Objects(context.Background(), t, client, bucketName, prefix)
+		if destBucket != bucketName {
+			cleanupS3Objects(context.Background(), t, destClient, destBucket, prefix)
+		}
+	})
+
+	src := s3.New(client, bucketName, s3.WithPrefix(prefix+"src/"))
+	dst := s3.New(destClient, destBucket, s3.WithPrefix(prefix+"dst/"))
+
+	payload := []byte("cross-region copy payload")
+	if err := src.WriteAll(ctx, "obj", payload, &blobster.WriterOptions{ContentType: "text/plain"}); err != nil {
+		t.Fatalf("WriteAll source: %v", err)
+	}
+
+	copier, ok := blobster.Bucket(dst).(blobster.CrossRegionCopier)
+	if !ok {
+		t.Fatal("s3 bucket does not implement CrossRegionCopier")
+	}
+	op, err := copier.XCopyFrom(ctx, "obj", src, "obj", nil)
+	if err != nil {
+		t.Fatalf("XCopyFrom: %v", err)
+	}
+	select {
+	case <-op.Done():
+	case <-time.After(2 * time.Minute):
+		t.Fatal("cross-region copy did not complete")
+	}
+	if err := op.Err(); err != nil {
+		t.Fatalf("copy operation: %v", err)
+	}
+
+	got, err := dst.ReadAll(ctx, "obj")
+	if err != nil {
+		t.Fatalf("ReadAll destination: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("copied payload = %q, want %q", string(got), string(payload))
+	}
+}
+
 func cleanupS3Objects(ctx context.Context, t *testing.T, client *awss3.Client, bucketName, prefix string) {
 	t.Helper()
 	paginator := awss3.NewListObjectsV2Paginator(client, &awss3.ListObjectsV2Input{
