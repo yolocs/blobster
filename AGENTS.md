@@ -116,3 +116,10 @@ not buried in a commit message or an issue comment.
 
 - Use `go test -race ./...` for the required local verification.
 - **Sign off every commit** (`git commit -s`) — we keep a DCO trail.
+
+## Releasing
+
+A release is a signed, annotated semver tag — see
+[`docs/releasing.md`](docs/releasing.md). Release notes are not generated from
+labels; they are authored by reading the commits since the previous tag and
+placed in the tag's annotation message, which the release workflow publishes.

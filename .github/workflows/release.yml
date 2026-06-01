@@ -1,0 +1,76 @@
+name: Release
+
+# Cutting a release is just pushing a signed, annotated semver tag. This
+# workflow gates the tag on a clean build/test/vuln check, then publishes a
+# GitHub Release whose notes come from the tag's annotation message — author
+# them by reading through the commits since the last tag. There is no binary to
+# build: for a library the tagged source commit is the artifact, served by the
+# Go module proxy.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test -race ./...
+
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  release:
+    name: Publish GitHub release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Treat any tag carrying a pre-release suffix (e.g. v0.2.0-rc1) as a
+          # GitHub pre-release so it doesn't show up as "latest".
+          prerelease=""
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            prerelease="--prerelease"
+          fi
+          # Notes come from the annotated tag's message, authored when the tag
+          # was cut (git tag -s vX.Y.Z -F notes.md).
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-from-tag \
+            --verify-tag \
+            ${prerelease}
+
+      - name: Warm module proxy
+        # Best-effort: ask the proxy to fetch the new version so the first
+        # `go get` from a consumer is fast. Non-fatal if the proxy is slow.
+        continue-on-error: true
+        run: |
+          GOPROXY=proxy.golang.org go list -m \
+            "github.com/yolocs/blobster@${GITHUB_REF_NAME}"
