@@ -99,10 +99,15 @@ pin the interface and are the test substrate everything else relies on.
   millisecond timestamp + UUID), and a
   never-reset `receives` count surfaced on each message. Handlers must be
   idempotent (the lock's liveness-not-safety contract, per message).
-  - **Follow-up — dead-letter / max-receives:** route a message aside once
-    `receives` crosses a threshold, rather than redelivering forever. Deliberately
-    split out of the first cut; the never-reset `receives` count already lets a
-    caller implement a poison-message policy by hand in the meantime.
+  - **Dead-letter / max-receives — built and shipped.** `WithMaxReceives(n)`
+    moves a message aside to the queue's `dead/` sub-prefix once it has been
+    delivered `n` times, rather than redelivering forever. Lazy and single-mover
+    (the claiming worker performs the move after winning the lease; no sweeper),
+    the dead record retains the payload, user attributes, and final receive count.
+    Unset, dead-lettering is disabled and the never-reset `receives` count still
+    lets a caller build its own policy. **Follow-up — `WithDeadLetterQueue`:**
+    redirect dead letters into a separate queue instead of the in-prefix `dead/`;
+    deferred and additive.
 
 ### Cross-cutting
 - Signed/presigned URLs as a first-class capability (`SignedURLer`).

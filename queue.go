@@ -37,10 +37,11 @@ const (
 )
 
 // Sub-prefixes, relative to the queue's owned prefix, that separate the immutable
-// payloads from the mutating lease records.
+// payloads from the mutating lease records, and hold dead-lettered messages.
 const (
 	queueMsgPrefix   = "msg/"
 	queueLeasePrefix = "lease/"
+	queueDeadPrefix  = "dead/"
 )
 
 // Lease record field names, stored as the lease object's user metadata. They are
@@ -86,14 +87,15 @@ const queueJitterWindow = 16
 // A Queue is safe for concurrent use; construct one per prefix with NewQueue and
 // share it across workers. The bucket must advertise ConditionalWrites.
 type Queue struct {
-	bucket     Bucket // rooted at the queue's prefix via Sub
-	prefix     string // the caller-supplied prefix, normalized with a trailing slash
-	lease      time.Duration
-	renew      time.Duration
-	headWindow int
-	minPoll    time.Duration
-	maxPoll    time.Duration
-	clock      func() time.Time
+	bucket      Bucket // rooted at the queue's prefix via Sub
+	prefix      string // the caller-supplied prefix, normalized with a trailing slash
+	lease       time.Duration
+	renew       time.Duration
+	headWindow  int
+	minPoll     time.Duration
+	maxPoll     time.Duration
+	maxReceives int
+	clock       func() time.Time
 }
 
 // QueueOption configures a Queue.
@@ -138,6 +140,25 @@ func WithQueueReceiveBackoff(low, high time.Duration) QueueOption {
 // are compared against it on every host. Defaults to time.Now.
 func WithQueueClock(now func() time.Time) QueueOption {
 	return func(q *Queue) { q.clock = now }
+}
+
+// WithMaxReceives caps how many times a message may be delivered before it is
+// dead-lettered instead of redelivered forever. A message is delivered at most n
+// times; the next claim that would redeliver it (a takeover that observes the
+// receive count already at n) moves the message aside to the queue's dead/
+// sub-prefix — payload, user attributes, and final receive count retained for
+// inspection — and removes it from the live queue. The move is performed by the
+// claiming worker (no background sweeper) and is guarded by winning the lease
+// first, so exactly one worker performs it under contention.
+//
+// n <= 0 (the default) disables dead-lettering: a poison message is redelivered
+// forever, and the caller can implement its own policy from Message.Receives.
+//
+// The dead record carries the payload's user attributes plus the final receive
+// count under the reserved metadata key "receives"; a caller attribute of that
+// name is shadowed on the dead record only (see EnqueueOptions.Attributes).
+func WithMaxReceives(n int) QueueOption {
+	return func(q *Queue) { q.maxReceives = n }
 }
 
 // NewQueue returns a Queue that stores its messages under prefix in bucket. The
@@ -189,6 +210,9 @@ func NewQueue(bucket Bucket, prefix string, opts ...QueueOption) (*Queue, error)
 	if q.maxPoll < q.minPoll {
 		q.maxPoll = q.minPoll
 	}
+	if q.maxReceives < 0 {
+		q.maxReceives = 0
+	}
 	return q, nil
 }
 
@@ -198,6 +222,13 @@ type EnqueueOptions struct {
 	// the receiver via Message.Attributes. They are set once at enqueue and never
 	// touched again, so they never clash with the lease state on the separate
 	// lease object.
+	//
+	// One reserved name applies only when dead-lettering is enabled
+	// (WithMaxReceives): the dead record merges the final receive count into a
+	// copy of these attributes under the key "receives", so an attribute literally
+	// named "receives" is shadowed by the count on the dead record (the live
+	// Message.Attributes is unaffected). Avoid that name if you enable
+	// dead-lettering and need it preserved verbatim on dead records.
 	Attributes map[string]string
 }
 
@@ -223,6 +254,88 @@ func (q *Queue) writePayload(ctx context.Context, id string, r io.Reader, attrs 
 		DisableContentTypeDetection: true,
 		Metadata:                    attrs,
 	}, IfNotExists)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(w, r); err != nil {
+		return errors.Join(err, w.CloseWithError(err))
+	}
+	return w.Close()
+}
+
+// deadLetter moves a poison message out of the live queue into the dead/
+// sub-prefix and removes it. The caller must already hold the lease (leaseVersion
+// is the version it won), which makes it the sole mover under contention.
+//
+// The dead record carries the payload, its user attributes, and the final
+// receive count in one self-describing object. The base Copy is server-side but
+// cannot set destination metadata (and the receive count lives on the lease
+// object, not the payload), so the record is written by streaming the payload
+// into it with the count merged in — still no whole-body buffering.
+//
+// The live message is then removed payload-first, then lease. Payload-first is
+// the inverse of Ack's lease-first ordering and is deliberate: the caller holds a
+// live lease throughout, so deleting the payload first cannot resurrect the
+// message (a live-leased message is skipped by every contender, and once the
+// payload is gone it is not listed at all), whereas deleting the lease first would
+// re-expose the payload as an available message and redeliver one already
+// dead-lettered. A crash before the payload delete is recoverable — payload and
+// lease both survive with the count at the threshold, so the next claim re-runs
+// the idempotent move once the lease expires. A crash between the two deletes
+// leaves an empty-bodied orphan lease that discovery (which lists msg/) never
+// revisits: harmless, and it never resurrects the dead-lettered message.
+func (q *Queue) deadLetter(ctx context.Context, id string, receives int, leaseVersion string) error {
+	msgPath := queueMsgPrefix + id
+	leasePath := queueLeasePrefix + id
+
+	attrs, err := q.bucket.Attributes(ctx, msgPath)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		// A previous partial dead-letter already moved the payload; fall through to
+		// finish removing the live message.
+	case err != nil:
+		return err
+	default:
+		if err := q.writeDeadRecord(ctx, id, attrs.Metadata, receives); err != nil {
+			return err
+		}
+	}
+
+	if err := q.bucket.Delete(ctx, msgPath); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if err := q.bucket.Delete(ctx, leasePath, IfMatch(leaseVersion)); err != nil &&
+		!errors.Is(err, ErrPreconditionFailed) && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
+// writeDeadRecord streams the payload into the dead/ record, merging the final
+// receive count into the payload's user attributes as the record's metadata. The
+// write is unconditional so a retried dead-letter (after a partial earlier
+// attempt) simply rewrites identical content.
+func (q *Queue) writeDeadRecord(ctx context.Context, id string, attrs map[string]string, receives int) error {
+	meta := CloneMetadata(attrs)
+	if meta == nil {
+		meta = make(map[string]string, 1)
+	}
+	meta[queueReceivesField] = strconv.Itoa(receives)
+
+	r, err := q.bucket.NewReader(ctx, queueMsgPrefix+id, nil)
+	if errors.Is(err, ErrNotFound) {
+		return nil // payload vanished under us; a concurrent mover handled it
+	}
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	w, err := q.bucket.NewWriter(ctx, queueDeadPrefix+id, &WriterOptions{
+		ContentType:                 "application/octet-stream",
+		DisableContentTypeDetection: true,
+		Metadata:                    meta,
+	})
 	if err != nil {
 		return err
 	}
@@ -329,7 +442,25 @@ func (q *Queue) tryClaim(ctx context.Context, id, owner string) (*Message, error
 		if !queueLeaseExpired(fields, now) {
 			return nil, nil // a live holder owns it; skip
 		}
-		receives = queueParseReceives(fields) + 1
+		prev := queueParseReceives(fields)
+		if q.maxReceives > 0 && prev >= q.maxReceives {
+			// The message has been delivered its full allowance; dead-letter it
+			// instead of redelivering. Win the lease first (CAS on the stale
+			// version, receives left at prev since this is not a delivery) so the
+			// takeover makes us the sole mover under contention, then move it.
+			holdVersion, err := q.writeLease(ctx, leasePath, owner, now, prev, IfMatch(version))
+			if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
+				return nil, nil // lost the race; the winner dead-letters it
+			}
+			if err != nil {
+				return nil, err
+			}
+			if err := q.deadLetter(ctx, id, prev, holdVersion); err != nil {
+				return nil, err
+			}
+			return nil, nil // moved aside, not delivered
+		}
+		receives = prev + 1
 		newVersion, err = q.writeLease(ctx, leasePath, owner, now, receives, IfMatch(version))
 		if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
 			return nil, nil // someone else took over or deleted it first

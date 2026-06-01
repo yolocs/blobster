@@ -976,6 +976,329 @@ func TestQueueRenewerLeavesPayloadUntouched(t *testing.T) {
 	})
 }
 
+// TestQueueDeadLetterAtThreshold verifies the precise off-by-one: with
+// MaxReceives = K a message is delivered exactly K times, and the next claim
+// (which would be the (K+1)th delivery) dead-letters it instead, leaving the
+// dead record with the final receive count and the payload's user attributes and
+// removing the live message.
+func TestQueueDeadLetterAtThreshold(t *testing.T) {
+	t.Parallel()
+	const k = 3
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithQueueVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(time.Hour),
+			blobster.WithMaxReceives(k),
+		)
+		id := enqueueString(t, q, "poison", map[string]string{"kind": "job"})
+
+		// Deliver exactly K times, letting the lease expire between each so the next
+		// claim is a takeover.
+		for want := 1; want <= k; want++ {
+			msg, err := q.TryReceive(ctx)
+			if err != nil {
+				t.Fatalf("receive %d: %v", want, err)
+			}
+			if msg.ID() != id {
+				t.Fatalf("receive %d delivered %q, want %q", want, msg.ID(), id)
+			}
+			if msg.Receives() != want {
+				t.Fatalf("receive %d: Receives = %d, want %d", want, msg.Receives(), want)
+			}
+			clock.Advance(31 * time.Second)
+		}
+
+		// The (K+1)th claim dead-letters instead of delivering.
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("claim past threshold: got %v, want ErrNoMessages (dead-lettered)", err)
+		}
+
+		// Live message is gone.
+		if ok, _ := bucket.Exists(ctx, "jobs/msg/"+id); ok {
+			t.Error("payload still in the live queue after dead-letter")
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/lease/"+id); ok {
+			t.Error("lease record still present after dead-letter")
+		}
+
+		// Dead record retains the payload, its user attributes, and the final
+		// receive count (= K, the count at the last delivery).
+		deadAttrs, err := bucket.Attributes(ctx, "jobs/dead/"+id)
+		if err != nil {
+			t.Fatalf("dead record attributes: %v", err)
+		}
+		if got := deadAttrs.Metadata["kind"]; got != "job" {
+			t.Errorf("dead record kind = %q, want job (user attributes lost)", got)
+		}
+		if got := deadAttrs.Metadata["receives"]; got != fmt.Sprintf("%d", k) {
+			t.Errorf("dead record receives = %q, want %d", got, k)
+		}
+		body, err := bucket.ReadAll(ctx, "jobs/dead/"+id)
+		if err != nil {
+			t.Fatalf("dead record body: %v", err)
+		}
+		if string(body) != "poison" {
+			t.Errorf("dead record body = %q, want poison", body)
+		}
+
+		// And the queue stays empty: the dead record is not rediscovered.
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("dead record redelivered: %v", err)
+		}
+	})
+}
+
+// TestQueueDeadLetterLargePayloadStreamed pins the reason the dead-letter move
+// streams the payload instead of using a server-side Copy: a multi-megabyte
+// payload must round-trip onto the dead record intact (and, structurally, without
+// the move buffering the whole body), with the user attributes and final receive
+// count preserved.
+func TestQueueDeadLetterLargePayloadStreamed(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithQueueVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(time.Hour),
+			blobster.WithMaxReceives(1),
+		)
+		payload := bytes.Repeat([]byte("blobster-"), 700*1024) // ~6 MiB
+		id, err := q.Enqueue(ctx, bytes.NewReader(payload), &blobster.EnqueueOptions{
+			Attributes: map[string]string{"kind": "bulk"},
+		})
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+
+		// One delivery brings the count to the threshold; the next claim dead-letters.
+		if _, err := q.TryReceive(ctx); err != nil {
+			t.Fatalf("first receive: %v", err)
+		}
+		clock.Advance(31 * time.Second)
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("claim past threshold: got %v, want ErrNoMessages", err)
+		}
+
+		// The large payload survives the streamed move byte-for-byte on the dead
+		// record, with attributes and the final receive count.
+		deadAttrs, err := bucket.Attributes(ctx, "jobs/dead/"+id)
+		if err != nil {
+			t.Fatalf("dead record attributes: %v", err)
+		}
+		if got := deadAttrs.Metadata["kind"]; got != "bulk" {
+			t.Errorf("dead record kind = %q, want bulk", got)
+		}
+		if got := deadAttrs.Metadata["receives"]; got != "1" {
+			t.Errorf("dead record receives = %q, want 1", got)
+		}
+		r, err := bucket.NewReader(ctx, "jobs/dead/"+id, nil)
+		if err != nil {
+			t.Fatalf("open dead record: %v", err)
+		}
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("read dead record: %v", err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("close dead record: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("dead payload round-trip mismatch: got %d bytes, want %d", len(got), len(payload))
+		}
+	})
+}
+
+// TestQueueMaxReceivesDisabledRedeliversForever verifies the default (unset /
+// zero) disables dead-lettering: a message keeps being redelivered with a growing
+// receive count and never moves to dead/.
+func TestQueueMaxReceivesDisabledRedeliversForever(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithQueueVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(time.Hour),
+			// No WithMaxReceives: dead-lettering disabled.
+		)
+		id := enqueueString(t, q, "immortal", nil)
+
+		for want := 1; want <= 8; want++ {
+			msg, err := q.TryReceive(ctx)
+			if err != nil {
+				t.Fatalf("receive %d: %v", want, err)
+			}
+			if msg.Receives() != want {
+				t.Fatalf("receive %d: Receives = %d, want %d", want, msg.Receives(), want)
+			}
+			clock.Advance(31 * time.Second)
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/dead/"+id); ok {
+			t.Error("message dead-lettered with MaxReceives unset")
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/msg/"+id); !ok {
+			t.Error("payload disappeared from the live queue with dead-lettering disabled")
+		}
+	})
+}
+
+// TestQueueDeadLetterSingleMoverUnderContention verifies that when many workers
+// race the dead-letter transition at the threshold, exactly one performs the
+// move: winning the lease first serializes the movers, and the result is a single
+// dead record with no orphaned live state.
+func TestQueueDeadLetterSingleMoverUnderContention(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithQueueVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(time.Hour),
+			blobster.WithMaxReceives(1),
+		)
+		id := enqueueString(t, q, "racey", nil)
+
+		// One delivery brings the receive count to the threshold (1); after the
+		// lease expires, every contender's next claim wants to dead-letter it.
+		first, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("first receive: %v", err)
+		}
+		if first.Receives() != 1 {
+			t.Fatalf("first Receives = %d, want 1", first.Receives())
+		}
+		clock.Advance(31 * time.Second)
+
+		const contenders = 16
+		var (
+			wg    sync.WaitGroup
+			start = make(chan struct{})
+		)
+		for range contenders {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				// Each contender either dead-letters (returns ErrNoMessages, having
+				// moved nothing it can deliver) or finds nothing to claim. None must
+				// ever receive the message as a live delivery.
+				if msg, err := q.TryReceive(ctx); err == nil {
+					t.Errorf("a contender received a message past the threshold: %q", msg.ID())
+				} else if !errors.Is(err, blobster.ErrNoMessages) {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		// Exactly one dead record, and the live message fully removed.
+		deadAttrs, err := bucket.Attributes(ctx, "jobs/dead/"+id)
+		if err != nil {
+			t.Fatalf("dead record missing after contended dead-letter: %v", err)
+		}
+		if got := deadAttrs.Metadata["receives"]; got != "1" {
+			t.Errorf("dead record receives = %q, want 1", got)
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/msg/"+id); ok {
+			t.Error("payload left in the live queue after dead-letter")
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/lease/"+id); ok {
+			t.Error("orphaned lease left after dead-letter")
+		}
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("queue not drained after dead-letter: %v", err)
+		}
+	})
+}
+
+// TestQueueDeadLetterResumesAfterPartialMove verifies the dead-letter move is
+// idempotent across a crash in its recoverable window: the dead record is written
+// (the copy) but the payload delete is failed, so the mover's still-live lease and
+// the payload both survive with the receive count at the threshold. The mover
+// holds a live lease throughout, so no contender resurrects the message; once that
+// lease expires the next claim re-runs the (idempotent) dead-letter and completes
+// it — overwriting the dead record, deleting the payload, and dropping the lease.
+func TestQueueDeadLetterResumesAfterPartialMove(t *testing.T) {
+	t.Parallel()
+	fb := newFaultBucket(mem.New())
+	clock := newManualClock()
+	q := mustNewQueue(t, fb, "jobs/",
+		blobster.WithQueueClock(clock.Now),
+		blobster.WithQueueVisibilityLease(30*time.Second),
+		blobster.WithQueueRenewInterval(time.Hour),
+		blobster.WithMaxReceives(1),
+	)
+	ctx := t.Context()
+	id := enqueueString(t, q, "poison", map[string]string{"kind": "job"})
+
+	first, err := q.TryReceive(ctx)
+	if err != nil {
+		t.Fatalf("first receive: %v", err)
+	}
+	_ = first
+	clock.Advance(31 * time.Second)
+
+	// Fail the payload delete (the move's first delete, after the dead-record copy).
+	// The dead record lands but the live message is not yet removed.
+	fb.setDeleteHook(func(key string) error {
+		if strings.HasPrefix(key, "msg/") {
+			return errors.New("crash before payload delete")
+		}
+		return nil
+	})
+	if _, err := q.TryReceive(ctx); err == nil {
+		t.Fatal("expected the injected payload-delete failure to surface")
+	}
+	fb.setDeleteHook(nil)
+
+	// Dead record written; payload and the mover's live lease both still present.
+	if ok, _ := fb.Exists(ctx, "jobs/dead/"+id); !ok {
+		t.Fatal("dead record not written before the simulated crash")
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/msg/"+id); !ok {
+		t.Fatal("payload should still be present after the failed payload delete")
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/lease/"+id); !ok {
+		t.Fatal("the mover's lease should still be present")
+	}
+
+	// The mover's lease is live, so a claim right now finds nothing to do.
+	if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+		t.Fatalf("claim while mover holds the lease: got %v, want ErrNoMessages", err)
+	}
+
+	// Once that lease expires, the next claim re-runs the dead-letter and completes
+	// it, without ever delivering the message afresh.
+	clock.Advance(31 * time.Second)
+	if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+		t.Fatalf("resumed dead-letter: got %v, want ErrNoMessages", err)
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/msg/"+id); ok {
+		t.Error("payload not removed by the resumed dead-letter")
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/lease/"+id); ok {
+		t.Error("lease not removed by the resumed dead-letter")
+	}
+	deadAttrs, err := fb.Attributes(ctx, "jobs/dead/"+id)
+	if err != nil {
+		t.Fatalf("dead record attributes: %v", err)
+	}
+	if got := deadAttrs.Metadata["receives"]; got != "1" {
+		t.Errorf("dead record receives = %q, want 1", got)
+	}
+	if got := deadAttrs.Metadata["kind"]; got != "job" {
+		t.Errorf("dead record kind = %q, want job", got)
+	}
+}
+
 // TestQueueMalformedLeaseRecordRecoverable verifies a lease record written out of
 // band with no deadline and a garbage receives count is treated as expired and
 // taken over, with a sane receives count — mirroring the lock's malformed-record

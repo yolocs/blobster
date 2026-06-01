@@ -59,7 +59,10 @@ if err := bucket.WriteAll(ctx, "hello.txt", []byte("hello"), &blobster.WriterOpt
 `blobster.NewQueue` turns any bucket that supports conditional writes into a
 competing-consumers work queue. It owns a caller-supplied prefix and stores each
 message as an immutable payload plus a separate lease record; handlers must be
-idempotent (delivery is at-least-once).
+idempotent (delivery is at-least-once). `WithMaxReceives(n)` opts into
+dead-lettering: after `n` deliveries a poison message is moved aside to the
+queue's `dead/` sub-prefix (payload, user attributes, and final receive count
+retained) instead of being redelivered forever.
 
 ```go
 q, err := blobster.NewQueue(bucket, "jobs/", blobster.WithQueueVisibilityLease(15*time.Second))
