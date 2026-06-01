@@ -221,6 +221,14 @@ func (b *Bucket) Sub(prefix string) blobster.Bucket {
 	}
 }
 
+func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions ...blobster.Precondition) (string, error) {
+	normalized, compiled, err := blobster.PrepareUpdateMetadata(md, preconditions)
+	if err != nil {
+		return "", err
+	}
+	return b.backend.UpdateMetadata(ctx, b.objectKey(key), normalized, compiled)
+}
+
 func (b *Bucket) Upload(ctx context.Context, key string, r io.Reader, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
 	cloned, err := blobster.RequireUploadOptions(opts)
 	if err != nil {
@@ -264,6 +272,7 @@ type backend interface {
 	Attributes(ctx context.Context, key string) (*blobster.Attributes, error)
 	NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error)
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
+	UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions blobster.Preconditions) (string, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
 	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
 	XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error)
@@ -392,6 +401,21 @@ func (b *azureBackend) NewWriter(ctx context.Context, key string, opts *blobster
 		return nil, err
 	}
 	return w, nil
+}
+
+func (b *azureBackend) UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions blobster.Preconditions) (string, error) {
+	// Set Blob Metadata replaces the whole metadata set and leaves the body
+	// untouched; a nil/empty map clears it. The new ETag is the new version.
+	azmd, err := toAzureMetadata(md)
+	if err != nil {
+		return "", err
+	}
+	opts := &blob.SetMetadataOptions{AccessConditions: modifiedConditions(preconditions)}
+	resp, err := b.client.NewBlobClient(escapeKey(key, false)).SetMetadata(ctx, azmd, opts)
+	if err != nil {
+		return "", mapError(err)
+	}
+	return etagVersion(resp.ETag), nil
 }
 
 func (b *azureBackend) Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error {

@@ -227,6 +227,10 @@ func (b *fakeBackend) NewWriter(ctx context.Context, key string, opts *blobster.
 	return b.bucket.NewWriter(ctx, key, opts, preconditionsToList(preconditions)...)
 }
 
+func (b *fakeBackend) UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions blobster.Preconditions) (string, error) {
+	return b.bucket.UpdateMetadata(ctx, key, md, preconditionsToList(preconditions)...)
+}
+
 func (b *fakeBackend) Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error {
 	return b.bucket.Delete(ctx, key, preconditionsToList(preconditions)...)
 }

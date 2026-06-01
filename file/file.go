@@ -344,6 +344,44 @@ func (b *Bucket) Sub(prefix string) blobster.Bucket {
 	}
 }
 
+func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions ...blobster.Precondition) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	normalized, compiled, err := blobster.PrepareUpdateMetadata(md, preconditions)
+	if err != nil {
+		return "", err
+	}
+	p, err := b.paths(key)
+	if err != nil {
+		return "", err
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	current, exists, err := b.statVersion(p)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("%w: %s", blobster.ErrNotFound, key)
+	}
+	if !conditionsPass(compiled, current, true) {
+		return "", fmt.Errorf("%w: %s", blobster.ErrPreconditionFailed, key)
+	}
+
+	// Rewrite only the metadata sidecar; the data file (existence and body source
+	// of truth) is left untouched, so the body and its ModTime are preserved.
+	attrs := current.Clone()
+	attrs.Metadata = blobster.CloneMetadata(normalized)
+	attrs.Version = newVersion()
+	if err := b.writeFileAtomic(p.meta, mustMarshalAttrs(attrs)); err != nil {
+		return "", err
+	}
+	return attrs.Version, nil
+}
+
 func (b *Bucket) Upload(ctx context.Context, key string, r io.Reader, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
 	cloned, err := blobster.RequireUploadOptions(opts)
 	if err != nil {

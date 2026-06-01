@@ -45,10 +45,14 @@ func TestCloudBucket(t *testing.T) {
 		cleanupGCSObjects(context.Background(), t, client, bucketName, prefix)
 	})
 
-	blobtest.TestBucket(t, func(t *testing.T) blobster.Bucket {
+	newBucket := func(t *testing.T) blobster.Bucket {
 		t.Helper()
 		return gcs.New(client, bucketName, gcs.WithPrefix(prefix))
-	})
+	}
+	blobtest.TestBucket(t, newBucket)
+	// GCS advances metageneration on a metadata-only update, which the
+	// (generation, metageneration) version token reflects.
+	blobtest.TestBucketMetadataAdvancesVersion(t, newBucket)
 }
 
 // TestCloudCrossRegionCopy exercises the real CrossRegionCopier path: it writes

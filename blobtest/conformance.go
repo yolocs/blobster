@@ -222,6 +222,78 @@ func TestBucket(t *testing.T, newBucket BucketFactory) {
 		}
 	})
 
+	t.Run("update metadata replaces map preserves body and is conditional", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		bucket := newBucket(t)
+
+		opts := &blobster.WriterOptions{
+			ContentType: "text/plain",
+			Metadata:    map[string]string{"owner": "alice", "stage": "start"},
+		}
+		if err := bucket.WriteAll(ctx, "md", []byte("body one"), opts); err != nil {
+			t.Fatalf("WriteAll: %v", err)
+		}
+
+		version, err := bucket.UpdateMetadata(ctx, "md", map[string]string{"stage": "done"})
+		if err != nil {
+			t.Fatalf("UpdateMetadata: %v", err)
+		}
+		if version == "" {
+			t.Fatal("UpdateMetadata returned an empty version token")
+		}
+
+		attrs, err := bucket.Attributes(ctx, "md")
+		if err != nil {
+			t.Fatalf("Attributes: %v", err)
+		}
+		// Replace, not merge: "owner" is gone and only "stage" remains.
+		if diff := cmp.Diff(map[string]string{"stage": "done"}, attrs.Metadata); diff != "" {
+			t.Fatalf("metadata after update mismatch (-want +got):\n%s", diff)
+		}
+		if attrs.ContentType != "text/plain" {
+			t.Fatalf("ContentType after update = %q, want text/plain (preserved)", attrs.ContentType)
+		}
+		if attrs.Version != version {
+			t.Fatalf("Attributes.Version = %q, want returned token %q", attrs.Version, version)
+		}
+		body, err := bucket.ReadAll(ctx, "md")
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if string(body) != "body one" {
+			t.Fatalf("body after update = %q, want body one (preserved)", string(body))
+		}
+
+		// A conditional update is gated on the current version. A body rewrite with
+		// different bytes advances the version on every backend (even s3, whose
+		// token is the content ETag), so the pre-rewrite token is stale.
+		stale := attrs.Version
+		if err := bucket.WriteAll(ctx, "md", []byte("body two differs"), &blobster.WriterOptions{ContentType: "text/plain"}); err != nil {
+			t.Fatalf("WriteAll rewrite: %v", err)
+		}
+		current, err := bucket.Attributes(ctx, "md")
+		if err != nil {
+			t.Fatalf("Attributes after rewrite: %v", err)
+		}
+		if _, err := bucket.UpdateMetadata(ctx, "md", map[string]string{"stage": "stale"}, blobster.IfMatch(stale)); !errors.Is(err, blobster.ErrPreconditionFailed) {
+			t.Fatalf("stale IfMatch UpdateMetadata error = %v, want ErrPreconditionFailed", err)
+		}
+		if _, err := bucket.UpdateMetadata(ctx, "md", map[string]string{"stage": "fresh"}, blobster.IfMatch(current.Version)); err != nil {
+			t.Fatalf("current IfMatch UpdateMetadata: %v", err)
+		}
+
+		// IfNotExists is meaningless for an in-place metadata update and is rejected.
+		if _, err := bucket.UpdateMetadata(ctx, "md", nil, blobster.IfNotExists); !errors.Is(err, blobster.ErrInvalidOption) {
+			t.Fatalf("IfNotExists UpdateMetadata error = %v, want ErrInvalidOption", err)
+		}
+
+		// A missing key reports ErrNotFound, distinct from a precondition failure.
+		if _, err := bucket.UpdateMetadata(ctx, "absent", map[string]string{"k": "v"}); !errors.Is(err, blobster.ErrNotFound) {
+			t.Fatalf("UpdateMetadata on missing key error = %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("concurrent create-only writes have exactly one winner", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()
@@ -408,6 +480,51 @@ func TestBucket(t *testing.T, newBucket BucketFactory) {
 		}
 		if !errors.Is(err, blobster.ErrUnsupported) {
 			t.Fatalf("SignedURL error = %v, want ErrUnsupported", err)
+		}
+	})
+}
+
+// TestBucketMetadataAdvancesVersion asserts that a metadata-only UpdateMetadata
+// advances the object's version token, so the pre-update token is rejected by a
+// later conditional metadata update. This holds for the mem, file, gcs, and
+// azureblob drivers. It deliberately excludes s3, whose version token is the
+// object's ETag — a content hash that a metadata-only self-copy leaves
+// unchanged — so an s3 metadata update returns the same token and CAS-on-metadata
+// there only guards against body rewrites (see docs/architecture.md). Drivers
+// that advance the token call this in addition to TestBucket.
+func TestBucketMetadataAdvancesVersion(t *testing.T, newBucket BucketFactory) {
+	t.Helper()
+
+	t.Run("metadata-only update advances the version token", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		bucket := newBucket(t)
+
+		if err := bucket.WriteAll(ctx, "md-ver", []byte("body"), &blobster.WriterOptions{
+			ContentType: "text/plain",
+			Metadata:    map[string]string{"stage": "start"},
+		}); err != nil {
+			t.Fatalf("WriteAll: %v", err)
+		}
+		before, err := bucket.Attributes(ctx, "md-ver")
+		if err != nil {
+			t.Fatalf("Attributes: %v", err)
+		}
+
+		next, err := bucket.UpdateMetadata(ctx, "md-ver", map[string]string{"stage": "mid"})
+		if err != nil {
+			t.Fatalf("UpdateMetadata: %v", err)
+		}
+		if next == "" || next == before.Version {
+			t.Fatalf("UpdateMetadata version = %q, want a new token distinct from %q", next, before.Version)
+		}
+
+		// The pre-update token is now stale even though the body never changed.
+		if _, err := bucket.UpdateMetadata(ctx, "md-ver", map[string]string{"stage": "stale"}, blobster.IfMatch(before.Version)); !errors.Is(err, blobster.ErrPreconditionFailed) {
+			t.Fatalf("stale IfMatch after metadata-only update = %v, want ErrPreconditionFailed", err)
+		}
+		if _, err := bucket.UpdateMetadata(ctx, "md-ver", map[string]string{"stage": "fresh"}, blobster.IfMatch(next)); err != nil {
+			t.Fatalf("current IfMatch after metadata-only update: %v", err)
 		}
 	})
 }

@@ -198,6 +198,14 @@ func (b *Bucket) Sub(prefix string) blobster.Bucket {
 	}
 }
 
+func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions ...blobster.Precondition) (string, error) {
+	normalized, compiled, err := blobster.PrepareUpdateMetadata(md, preconditions)
+	if err != nil {
+		return "", err
+	}
+	return b.backend.UpdateMetadata(ctx, b.objectKey(key), normalized, compiled)
+}
+
 func (b *Bucket) Upload(ctx context.Context, key string, r io.Reader, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
 	cloned, err := blobster.RequireUploadOptions(opts)
 	if err != nil {
@@ -241,6 +249,7 @@ type backend interface {
 	Attributes(ctx context.Context, key string) (*blobster.Attributes, error)
 	NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error)
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
+	UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions blobster.Preconditions) (string, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
 	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
 	XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error)
@@ -320,6 +329,29 @@ func (b *storageBackend) NewWriter(ctx context.Context, key string, opts *blobst
 		}
 	}
 	return &writeCloser{w: writer}, nil
+}
+
+func (b *storageBackend) UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions blobster.Preconditions) (string, error) {
+	obj := b.object(key)
+	conds, ok, err := gcsConditions(preconditions)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		obj = obj.If(conds)
+	}
+	// Replace semantics: a non-nil (possibly empty) map replaces the whole user
+	// metadata. nil would be read by the SDK as "leave unchanged", so a nil/empty
+	// md is sent as an empty map to clear it. The update bumps metageneration but
+	// not generation, which the (generation, metageneration) token reflects.
+	if md == nil {
+		md = map[string]string{}
+	}
+	attrs, err := obj.Update(ctx, storage.ObjectAttrsToUpdate{Metadata: md})
+	if err != nil {
+		return "", mapError(err)
+	}
+	return formatVersion(attrs.Generation, attrs.Metageneration), nil
 }
 
 func (b *storageBackend) Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error {
@@ -494,7 +526,7 @@ func (b *storageBackend) openReader(ctx context.Context, key string, offset, len
 		ContentType:     reader.Attrs.ContentType,
 		ModTime:         reader.Attrs.LastModified,
 		Size:            reader.Attrs.Size,
-		Version:         strconv.FormatInt(reader.Attrs.Generation, 10),
+		Version:         formatVersion(reader.Attrs.Generation, reader.Attrs.Metageneration),
 		Native:          reader,
 	}
 	return reader, attrs, nil
@@ -664,9 +696,35 @@ func convertAttrs(attrs *storage.ObjectAttrs) *blobster.Attributes {
 		ModTime:            attrs.Updated,
 		Size:               attrs.Size,
 		MD5:                bytes.Clone(attrs.MD5),
-		Version:            strconv.FormatInt(attrs.Generation, 10),
+		Version:            formatVersion(attrs.Generation, attrs.Metageneration),
 		Native:             attrs,
 	}
+}
+
+// The GCS version token is the (generation, metageneration) pair, formatted
+// "<generation>/<metageneration>". Generation identifies the object's content;
+// metageneration advances on a metadata-only change (UpdateMetadata) without a
+// new generation. Pairing them means IfMatch is sensitive to metadata changes —
+// a metadata-only update bumps the token, so a stale CAS fails — which
+// generation alone could not detect.
+func formatVersion(generation, metageneration int64) string {
+	return strconv.FormatInt(generation, 10) + "/" + strconv.FormatInt(metageneration, 10)
+}
+
+func parseVersion(token string) (generation, metageneration int64, err error) {
+	gen, meta, ok := strings.Cut(token, "/")
+	if !ok {
+		return 0, 0, fmt.Errorf("%w: GCS version token must be <generation>/<metageneration>", blobster.ErrInvalidOption)
+	}
+	generation, err = strconv.ParseInt(gen, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("%w: GCS version token must be <generation>/<metageneration>", blobster.ErrInvalidOption)
+	}
+	metageneration, err = strconv.ParseInt(meta, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("%w: GCS version token must be <generation>/<metageneration>", blobster.ErrInvalidOption)
+	}
+	return generation, metageneration, nil
 }
 
 func gcsConditions(preconditions blobster.Preconditions) (storage.Conditions, bool, error) {
@@ -674,16 +732,23 @@ func gcsConditions(preconditions blobster.Preconditions) (storage.Conditions, bo
 	case preconditions.IfNotExists:
 		return storage.Conditions{DoesNotExist: true}, true, nil
 	case preconditions.IfMatch != "":
-		generation, err := strconv.ParseInt(preconditions.IfMatch, 10, 64)
+		generation, metageneration, err := parseVersion(preconditions.IfMatch)
 		if err != nil {
-			return storage.Conditions{}, false, fmt.Errorf("%w: GCS version token must be a generation number", blobster.ErrInvalidOption)
+			return storage.Conditions{}, false, err
 		}
-		return storage.Conditions{GenerationMatch: generation}, true, nil
+		// Match the exact version including metadata: both generation and
+		// metageneration must equal the token's.
+		return storage.Conditions{GenerationMatch: generation, MetagenerationMatch: metageneration}, true, nil
 	case preconditions.IfNotMatch != "":
-		generation, err := strconv.ParseInt(preconditions.IfNotMatch, 10, 64)
+		generation, _, err := parseVersion(preconditions.IfNotMatch)
 		if err != nil {
-			return storage.Conditions{}, false, fmt.Errorf("%w: GCS version token must be a generation number", blobster.ErrInvalidOption)
+			return storage.Conditions{}, false, err
 		}
+		// GCS conditions are ANDed, so the precise "(generation, metageneration)
+		// differs" disjunction is not expressible; we compare the generation only.
+		// A metadata-only difference (same generation) is therefore not
+		// distinguished by IfNotMatch — IfMatch is the precondition that sees
+		// metadata changes.
 		return storage.Conditions{GenerationNotMatch: generation}, true, nil
 	default:
 		return storage.Conditions{}, false, nil

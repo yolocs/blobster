@@ -108,21 +108,31 @@ NewWriter(ctx, key, *WriterOptions) (Writer, error)   // streaming write; commit
 ReadAll(ctx, key) ([]byte, error)
 SignedURL(ctx, key, *SignedURLOptions) (string, error)
 Sub(prefix) Bucket
+UpdateMetadata(ctx, key, map[string]string, ...Precondition) (newVersion, error)  // conditional metadata-only update
 Upload(ctx, key, io.Reader, *WriterOptions, ...Precondition) error
 WriteAll(ctx, key, []byte, *WriterOptions, ...Precondition) error
 Capabilities() Capabilities
 ```
 
-- **`Attributes`** carries an opaque **version token** (an ETag, a GCS
-  generation, an Azure ETag) that feeds conditional operations. blobster does
-  not interpret it beyond equality.
+- **`Attributes`** carries an opaque **version token** (an S3/Azure ETag, a GCS
+  `(generation, metageneration)` pair) that feeds conditional operations.
+  blobster does not interpret it beyond equality.
+- **`UpdateMetadata`** changes an object's user metadata **in place** (the body
+  is untouched) and returns the new version token. It has **replace semantics**:
+  the supplied map is the complete desired metadata and replaces the prior map in
+  full (a nil/empty map clears it); merge/patch is not portable across backends.
+  It honors `IfMatch`/`IfNotMatch` like `WriteAll` (rejecting `IfNotExists`,
+  which is contradictory for an in-place update); the returned version saves a
+  follow-up `Attributes` read in a CAS loop. See
+  [Metadata-only update](#metadata-only-update) for the per-backend mechanism and
+  the s3 version-token caveat.
 - **`NewWriter`** returns a `Writer` whose bytes are committed on `Close`; a
   writer abandoned via `CloseWithError`, its cancelable context, or a context
   cancel must **not** leave a partial, readable object. This matters for
   `mem`/`file`, where a naive close would otherwise commit a truncated body, and
   for cloud drivers where uploads have explicit abort/error-close paths.
-- **Preconditions** (next section) are accepted by the write and delete paths
-  only. `Copy` is an unconditional server-side copy on every backend — it takes
+- **Preconditions** (next section) are accepted by the write, delete, and
+  metadata-update paths only. `Copy` is an unconditional server-side copy on every backend — it takes
   no preconditions, matching `gocloud.dev/blob` and avoiding a precondition
   affordance that S3's `CopyObject` (which exposes only *source* conditions)
   could not honor on the destination. Callers needing native source conditions
@@ -155,7 +165,7 @@ Mapping per backend:
 | Backend | `IfNotExists` | `IfMatch` / `IfNotMatch` |
 |--------|---------------|--------------------------|
 | `s3`    | `If-None-Match: *` on PUT | `If-Match` / `If-None-Match` on the conditional write |
-| `gcs`   | `storage.Conditions{DoesNotExist: true}` | `GenerationMatch` / `GenerationNotMatch` |
+| `gcs`   | `storage.Conditions{DoesNotExist: true}` | `GenerationMatch`+`MetagenerationMatch` / `GenerationNotMatch` (see below) |
 | `azureblob` | `If-None-Match: *` | `If-Match` / `If-None-Match` (ETag) |
 | `mem`   | in-process compare under a lock | version compare under a lock |
 | `file`  | absence check + atomic rename, under a per-bucket lock | sidecar version-token compare + atomic rename, under a per-bucket lock |
@@ -164,12 +174,57 @@ A failed precondition is the sentinel `ErrPreconditionFailed`, distinct from
 `ErrNotFound`. Conditional support is advertised as the `ConditionalWrites`
 capability; a backend without it cannot host the lock or any CAS utility.
 
+The **GCS version token is the `(generation, metageneration)` pair**, not the
+generation alone. A metadata-only update (`UpdateMetadata`) bumps metageneration
+without a new generation, so a generation-only token would be blind to it and two
+writers could both CAS-succeed. `IfMatch` therefore checks **both** components
+(`GenerationMatch`+`MetagenerationMatch`) — "this exact version, metadata
+included." `IfNotMatch` checks the **generation only**: GCS ANDs its conditions,
+so the precise "(generation, metageneration) differs" disjunction is not
+expressible, and a metadata-only difference is the case `IfNotMatch` cannot
+distinguish. The lease lock is unaffected — it does full writes, which reset
+metageneration to 1, so the pair advances with the generation.
+
 All three production backends also support **conditional delete** (S3 natively
 since 2025-09; GCS and Azure all along), so a lock's safe release is a single
 atomic op — blobster needs no CAS-to-tombstone workaround. Every backend returns
 **HTTP 412** on a failed precondition, mapped to `ErrPreconditionFailed`; the
 per-SDK error matching is recorded in
 [`cloud-backend-research.md`](cloud-backend-research.md).
+
+### Metadata-only update
+
+`UpdateMetadata` is a **base `Bucket` operation** (every driver implements it),
+not an optional capability: all five drivers can replace an object's user
+metadata without re-uploading the body, so there is no backend that lacks it.
+The conditional behavior reuses the one coordination primitive — preconditions
+are honored exactly as on `WriteAll` — so the operation needs no new mechanism,
+only a backend call that touches metadata in place:
+
+| Backend | Mechanism |
+|---------|-----------|
+| `mem`   | rewrite metadata under the lock, bump the in-process version |
+| `file`  | rewrite the JSON sidecar atomically under the per-bucket lock; data file (body + its ModTime) untouched; new version token |
+| `s3`    | `CopyObject` onto the same key with `MetadataDirective=REPLACE` and `CopySourceIfMatch`/`-IfNoneMatch` for the condition; system headers (content-type, …) re-supplied from current attributes because `REPLACE` drops them |
+| `gcs`   | `ObjectHandle.Update` (conditional); bumps metageneration, which the `(generation, metageneration)` token reflects |
+| `azureblob` | `Set Blob Metadata` with `If-Match`/`If-None-Match`; the fresh ETag is the new version |
+
+Replace semantics are uniform: the supplied map fully replaces the prior user
+metadata (empty/nil clears it). `IfNotExists` is rejected up front
+(`ErrInvalidOption`) — updating an object that must not exist is contradictory,
+and no backend can express it.
+
+**s3 version-token caveat.** On s3 the version token is the object **ETag**, a
+content hash. A metadata-only self-copy preserves the body, so the ETag — and
+thus the token — is **unchanged** by `UpdateMetadata`. Unlike GCS (which has
+metageneration), s3 has no per-metadata version, so an s3 metadata update returns
+the same token and `IfMatch`-based CAS on s3 guards only against **body**
+rewrites, not against a concurrent metadata-only update. mem, file, gcs, and
+azureblob all advance the token on a metadata-only change; the shared
+`blobtest.TestBucketMetadataAdvancesVersion` asserts that and is run by those four
+drivers, not by s3. This is analogous to the R2 conditional-delete gap: a
+backend-specific limitation a caller needing the guarantee must gate on the
+backend, documented rather than hidden.
 
 ## Optional capabilities
 
