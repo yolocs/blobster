@@ -595,6 +595,10 @@ pair of objects under a caller-supplied prefix the queue owns wholesale:
                       size); user attributes live in its metadata
 <prefix>/lease/<id>   lease record: empty body, metadata {owner, lease
                       (RFC3339Nano deadline), receives}; the per-message "lock"
+<prefix>/dead/<id>    dead-lettered message (only when WithMaxReceives is set):
+                      the payload, its user attributes, and the final receive
+                      count, retained for inspection after the message is removed
+                      from the live queue
 ```
 
 Splitting the immutable payload from the mutating lease is the load-bearing
@@ -613,10 +617,12 @@ digraph queue {
   avail [label="available\n(payload exists,\nno live lease)"];
   held  [label="leased\n(owner, lease, receives)"];
   gone  [label="acked\n(both deleted)"];
+  dead  [label="dead-lettered\n(moved to dead/,\nremoved from live queue)"];
   avail -> held [label="Receive:\nclaim lease (create if absent,\nor CAS-takeover if expired), receives++"];
   held  -> held [label="renew:\nCAS extend lease\n(payload untouched)"];
   held  -> gone [label="Ack:\nDelete lease (CAS) then payload"];
   held  -> avail [label="Nack / lease expiry:\nexpire lease in place\n(receives preserved)"];
+  avail -> dead [label="claim at threshold\n(receives >= MaxReceives):\nwin lease, move to dead/,\nremove live message"];
 }
 ```
 
@@ -641,6 +647,67 @@ digraph queue {
   message is immediately reclaimable.
 - **Redelivery** is identical to lock takeover: a crashed worker stops renewing,
   its lease deadline passes, and the next claimer CAS-takes-over with `receives++`.
+- **Dead-letter** (opt-in via `WithMaxReceives(n)`) caps redelivery: once a message
+  has been delivered `n` times, the next claim that would redeliver it moves it
+  aside to `dead/` instead. See [Dead-letter](#dead-letter--max-receives) below.
+
+### Dead-letter / max-receives
+
+Poison-message handling is opt-in through `WithMaxReceives(n)`; unset (`n <= 0`,
+the default) the queue redelivers forever and a caller can build its own policy
+from `Message.Receives`. The receive count already lives in the per-message lease
+record and is maintained by the claim/takeover path, so dead-letter adds only a
+threshold check and the move — no new lease state, no sweeper.
+
+**The decision rides the existing takeover.** A brand-new claim (create branch,
+`receives=1`) never dead-letters. On a takeover of an *expired* lease, the
+claimer reads the prior `receives`; if `MaxReceives > 0` and `receives >=
+MaxReceives`, it dead-letters instead of incrementing-and-delivering. The
+off-by-one: with `MaxReceives = K` a message is delivered exactly `K` times
+(`receives` 1..K), and the **(K+1)th** claim — the one that observes the count
+already at K — moves it aside. The dead record's final count is therefore `K`.
+
+**Lazy, single-mover, no sweeper.** The move is done by the worker that would
+otherwise have redelivered the message, with no background process:
+
+1. **Win the lease first** — a CAS takeover of the stale lease (`receives` left at
+   its prior value, since this is not a delivery). The winner now holds a *live*
+   lease, which makes it the **sole mover**: every contender that lists the same
+   message sees a live holder and skips, so exactly one worker performs the
+   transition under contention.
+2. **Write the dead record** at `dead/<id>`, carrying the payload, its user
+   attributes, and the final receive count.
+3. **Remove the live message** — delete the **payload first, then the lease.**
+   This is the *inverse* of Ack's lease-first ordering, and deliberately so: the
+   mover holds a live lease throughout, so deleting the payload first cannot
+   resurrect the message (no contender can claim a live-leased message, and once
+   the payload is gone it is not listed at all). A crash *before* the payload
+   delete is recoverable — the payload and the mover's lease both survive with the
+   count still at the threshold, so once that lease expires the next claim re-runs
+   the (idempotent) move and completes it. A crash *between* the payload and lease
+   deletes leaves an empty-bodied orphan lease that discovery (which lists `msg/`)
+   never revisits — harmless and it never resurrects the dead-lettered message,
+   the one residue the lease-first Ack ordering avoids but the dead-letter cannot,
+   because here the message must *not* come back.
+
+**Why a streamed move, not a server-side `Copy`.** The base `Copy` is server-side
+but copies only the source object's own metadata — the payload's user attributes,
+not the lease's `receives` — and the interface has no body-free metadata write. To
+land the payload, its user attributes, *and* the final receive count in one
+self-describing dead record, the move streams the payload into `dead/<id>` with
+`receives` merged into the metadata (reserving the `receives` metadata key on the
+dead record). This still honors "stream, don't buffer" — it never materializes the
+whole body — at the cost of routing the bytes through the mover rather than a pure
+server-side transfer. For the rare, terminal poison path that trade is worth a
+single self-describing record and no new interface primitive; a future
+`CopyOptions` metadata-override could restore the server-side transfer additively
+if it ever matters.
+
+**Deferred: redirect to a separate queue.** `WithDeadLetterQueue(*Queue)` (route
+poison messages into another queue rather than the in-prefix `dead/`) was
+considered and left out of this cut — the in-prefix `dead/` subtree is the simpler
+default and nothing yet needs the redirect. It stays purely additive if a need
+appears.
 
 **The lease engine is a focused parallel of the lock, not a dependency on it.**
 The per-message lease is the lock's algorithm with a richer record (it adds
@@ -698,10 +765,13 @@ wedged-but-alive worker holds its one message until process death (head-of-line
 on that message only, not a queue stall); and two objects per message with a
 non-atomic two-delete ack (a crash — or a concurrent claim — in the mid-ack
 window costs one idempotent redelivery, never an orphan). **Dead-letter /
-max-receives is deliberately out of scope here** (tracked separately); the
-`receives` count is surfaced on every `Message` so a caller can implement a
-poison-message policy today, and the never-reset count is what makes that
-possible.
+max-receives is opt-in** via `WithMaxReceives` (see
+[Dead-letter](#dead-letter--max-receives)); unset, a poison message is
+redelivered forever and the surfaced never-reset `receives` count lets a caller
+build its own policy. When set, a crash in the dead-letter move's narrow
+delete window can leave one empty-bodied orphan lease (harmless, never
+resurrects the message); redirecting dead letters to a *separate* queue is
+deferred.
 
 ## Code layout
 
@@ -803,9 +873,10 @@ internally and adds `ErrNoMessages`, `ErrMessageLost`, and
 - **A POSIX filesystem.** No partial in-place edits, no rename-as-move
   semantics beyond what `Copy` + `Delete` express.
 - **Resumable multipart** (persisting an upload id across processes) — backlog.
-- **Dead-letter / max-receives for the queue** — out of scope for the queue's
-  first cut and tracked separately; the never-reset `receives` count is surfaced
-  on every `Message` so a caller can build a poison-message policy meanwhile.
+- **Redirecting dead letters to a separate queue** (`WithDeadLetterQueue`) — the
+  in-prefix `dead/` sub-prefix is the only target for now; redirect is a deferred,
+  additive option. (Max-receives dead-lettering itself is implemented — see
+  [Dead-letter](#dead-letter--max-receives).)
 - **Other coordination primitives beyond the lock and queue** — exploratory; see
   `roadmap.md`.
 - **Ambient configuration / driver auto-registration** — intentionally absent;
