@@ -17,6 +17,12 @@ Optional:
 BLOBSTER_GCS_PREFIX=blobster/manual/ BLOBSTER_GCS_BUCKET=my-test-bucket go test -tags cloud ./gcs
 ```
 
+`TestCloudCrossRegionCopy` runs as part of the same package. By default it uses
+the same bucket with separate prefixes, which still exercises GCS `rewrite` and
+the `CopyOperation` handle. Set `BLOBSTER_GCS_XCOPY_DEST_BUCKET` to copy into a
+different bucket; if that bucket is in a different location, the test becomes a
+genuine cross-region copy.
+
 Credentials are the standard Google Application Default Credentials used by
 `cloud.google.com/go/storage`. Provide one of:
 
@@ -45,6 +51,12 @@ Optional:
 ```sh
 BLOBSTER_S3_PREFIX=blobster/manual/ BLOBSTER_S3_BUCKET=my-test-bucket go test -tags cloud ./s3
 ```
+
+`TestCloudCrossRegionCopy` runs as part of the same package. By default it uses
+the same bucket with separate prefixes, which still exercises server-side
+`CopyObject` and the `CopyOperation` handle. Set `BLOBSTER_S3_XCOPY_DEST_BUCKET`
+to copy into another bucket; set `BLOBSTER_S3_XCOPY_DEST_REGION` when the
+destination bucket is in a different region.
 
 Credentials and region come from the standard AWS default chain loaded by
 `github.com/aws/aws-sdk-go-v2/config.LoadDefaultConfig` — environment variables
@@ -105,6 +117,14 @@ Optional:
 BLOBSTER_AZURE_PREFIX=blobster/manual/ \
   BLOBSTER_AZURE_CONNECTION_STRING=... BLOBSTER_AZURE_CONTAINER=my-container go test -tags cloud ./azureblob
 ```
+
+`TestCloudCrossRegionCopy` runs as part of the same package. By default it uses
+the same container with separate prefixes, which still exercises `Copy Blob` and
+the `CopyOperation` handle. Set
+`BLOBSTER_AZURE_XCOPY_DEST_CONNECTION_STRING` and
+`BLOBSTER_AZURE_XCOPY_DEST_CONTAINER` to copy into another storage account; that
+path also verifies that the source client can mint the read SAS needed for a
+cross-account copy.
 
 The test builds a `*container.Client` from the connection string via
 `container.NewClientFromConnectionString`. A shared-key connection string is used

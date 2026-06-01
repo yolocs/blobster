@@ -1,12 +1,24 @@
 # blobster
 
-Cloud-agnostic utilities solely based on blob storage.
+Cloud-agnostic storage and coordination primitives built solely on blob storage.
 
-blobster starts with the same ordinary blob operations you expect from
-`gocloud.dev/blob` while keeping construction explicit: callers pass in native
-SDK clients, and drivers do not register themselves through import side effects.
+blobster is for teams that already have object storage everywhere and want to
+keep the rest of the dependency graph small. If you run across multiple clouds,
+or you are forced by platform, customer, or compliance boundaries to minimize
+extra infrastructure, a bucket is often the one primitive you can count on.
 
-## Status
+The project turns that bucket into a practical foundation: ordinary blob
+operations, conditional writes, a lease lock, a blob-backed work queue, and
+native server-side copy between regions/buckets/accounts where the backend
+supports it. There is no Redis, database, broker, sidecar, driver registry, or
+ambient cloud configuration. Callers pass in native SDK clients they configured
+themselves.
+
+The aim is not to replace every specialized service. It is to provide a small,
+boring substrate that is good enough for services that value portability,
+explicit construction, and minimum dependencies.
+
+## Status (v0.1 initial release candidate)
 
 Implemented:
 
@@ -34,9 +46,12 @@ Implemented:
 
 Planned:
 
-- multipart parallel-upload helper
+- generic multipart parallel-upload helper over a future `MultipartUploader`
+  capability
 
-## Example
+## Usage
+
+Construct a bucket from a caller-owned native SDK client:
 
 ```go
 ctx := context.Background()
@@ -47,10 +62,79 @@ if err != nil {
 defer client.Close()
 
 bucket := gcs.New(client, "my-bucket", gcs.WithPrefix("app/"))
-if err := bucket.WriteAll(ctx, "hello.txt", []byte("hello"), &blobster.WriterOptions{
-	ContentType: "text/plain",
+```
+
+The same pattern applies to the other drivers: `s3.New(client, bucket, ...)`,
+`azureblob.New(containerClient, ...)`, `file.New(dir)`, and `mem.New()`.
+
+### Basic blobs
+
+The base `Bucket` API covers read, write, range-read, list, copy, delete,
+attributes, metadata updates, preconditions, and signed URL hooks.
+
+```go
+if err := bucket.WriteAll(ctx, "users/42.json", []byte(`{"name":"Ada"}`), &blobster.WriterOptions{
+	ContentType: "application/json",
+	Metadata:    map[string]string{"owner": "accounts"},
 }, blobster.IfNotExists); err != nil {
 	return err
+}
+
+attrs, err := bucket.Attributes(ctx, "users/42.json")
+if err != nil {
+	return err
+}
+
+_, err = bucket.UpdateMetadata(ctx, "users/42.json", map[string]string{
+	"owner": "accounts",
+	"state": "indexed",
+})
+if err != nil {
+	return err
+}
+
+body, err := bucket.ReadAll(ctx, "users/42.json")
+if err != nil {
+	return err
+}
+_ = body
+
+// Optimistic update: only replace the object if the version we read is current.
+err = bucket.WriteAll(ctx, "users/42.json", []byte(`{"name":"Ada Lovelace"}`), &blobster.WriterOptions{
+	ContentType: "application/json",
+}, blobster.IfMatch(attrs.Version))
+if err != nil {
+	return err
+}
+```
+
+### Distributed lock
+
+`blobster.NewLocker` builds a lease lock on top of conditional writes. It is a
+portable coordination primitive for short critical sections; like any lease
+lock, handlers should be idempotent because a paused process can outlive its
+lease.
+
+```go
+locker := blobster.NewLocker(bucket)
+
+lock, err := locker.Acquire(ctx, "rollups/daily", blobster.WithLockOwner("worker-7"))
+if err != nil {
+	return err
+}
+defer func() {
+	_ = lock.Release(context.Background())
+}()
+
+if err := runDailyRollup(ctx); err != nil {
+	return err
+}
+
+select {
+case <-lock.Done():
+	return lock.Err() // ErrLockLost means the lease was no longer held.
+default:
+	return nil
 }
 ```
 
@@ -65,7 +149,10 @@ queue's `dead/` sub-prefix (payload, user attributes, and final receive count
 retained) instead of being redelivered forever.
 
 ```go
-q, err := blobster.NewQueue(bucket, "jobs/", blobster.WithQueueVisibilityLease(15*time.Second))
+q, err := blobster.NewQueue(bucket, "jobs/",
+	blobster.WithQueueVisibilityLease(15*time.Second),
+	blobster.WithMaxReceives(5),
+)
 if err != nil {
 	return err
 }
@@ -80,10 +167,45 @@ if err != nil {
 }
 body, err := msg.ReadAll(ctx)
 if err != nil {
-	return msg.Nack(ctx) // return it for redelivery
+	_ = msg.Nack(ctx) // return it for redelivery
+	return err
 }
-_ = body
+
+if err := handleJob(ctx, body); err != nil {
+	_ = msg.Nack(ctx)
+	return err
+}
 return msg.Ack(ctx) // processed; remove it
+```
+
+### Cross-region copy
+
+Cloud drivers that can copy server-side implement `blobster.CrossRegionCopier`.
+The source and destination must be buckets from the same backend family (`s3` to
+`s3`, `gcs` to `gcs`, `azureblob` to `azureblob`), but they may point at
+different buckets, regions, containers, or accounts when the provider supports
+that shape. The bytes do not stream through your process.
+
+```go
+src := s3.New(srcClient, "source-bucket", s3.WithPrefix("prod/"))
+dst := s3.New(dstClient, "archive-bucket", s3.WithPrefix("snapshots/"))
+
+copier, ok := blobster.Bucket(dst).(blobster.CrossRegionCopier)
+if !ok {
+	return blobster.ErrUnsupported
+}
+
+op, err := copier.XCopyFrom(ctx, "users/42.json", src, "users/42.json", nil)
+if err != nil {
+	return err
+}
+
+select {
+case <-op.Done():
+	return op.Err()
+case <-ctx.Done():
+	return ctx.Err()
+}
 ```
 
 For tests:

@@ -2,9 +2,10 @@
 
 Reference material: the cloud-provider API facts that establish blobster's
 viability. blobster's whole thesis is that a service needs *nothing but* a blob
-store to get a distributed lock, multipart parallel upload, and cross-region
-copy. That only holds if each target backend actually exposes the primitives
-those utilities require. This document records what we verified, with exact API
+store to get a distributed lock, a blob-backed work queue, multipart parallel
+upload, and cross-region copy. That only holds if each target backend actually
+exposes the primitives those utilities require. This document records what we
+verified, with exact API
 surfaces (Go SDK), hard limits, and sources, so we don't have to re-derive it.
 
 The **design conclusions** drawn from this research live in
@@ -15,15 +16,15 @@ the conclusion in the architecture doc.
 - **Researched:** 2026-05-28, against official provider docs and the current Go
   SDKs (`aws-sdk-go-v2`, `cloud.google.com/go/storage`,
   `github.com/Azure/azure-sdk-for-go/sdk/storage/azblob`).
-- **Verdict:** all three headline utilities — lock, cross-region copy, multipart
-  upload — are viable on S3, GCS, and Azure with blob storage as the only
-  dependency. Caveats are recorded per section.
+- **Verdict:** the lock and work queue are viable on S3, GCS, and Azure via
+  conditional writes; cross-region copy and multipart upload are viable via each
+  provider's native copy/upload APIs. Caveats are recorded per section.
 
 ## Summary
 
 | Utility | S3 | GCS | Azure |
 |--------|:--:|:---:|:-----:|
-| Lock (conditional writes) | ✅ | ✅ (write-rate bound) | ✅ (CAS, not native lease) |
+| Lock / queue (conditional writes) | ✅ | ✅ (write-rate bound) | ✅ (CAS, not native lease) |
 | Cross-region copy | ✅ (within one partition) | ✅ | ✅ (source SAS required) |
 | Multipart parallel upload | ✅ native MPU | ✅ via compose | ✅ via block blobs |
 
@@ -31,11 +32,12 @@ the conclusion in the architecture doc.
 
 ## 1. Conditional writes (the lock primitive)
 
-The lease + fencing lock is a generic algorithm over one optimistic-concurrency
-operation: **create-only** (first acquisition) and **compare-and-swap on a
-version token** (takeover after lease expiry, renewal, safe release). All three
-backends provide both atomically, server-side, with exactly-one-winner under
-concurrent writers, and all three are strongly consistent.
+The lease lock and work queue are generic algorithms over one
+optimistic-concurrency operation: **create-only** (first acquisition / first
+claim) and **compare-and-swap on a version token** (takeover after lease expiry,
+renewal, safe release). All three backends provide both atomically, server-side,
+with exactly-one-winner under concurrent writers, and all three are strongly
+consistent.
 
 | | Create-only | CAS overwrite / renew | Conditional delete (release) | Version token | Precondition failure |
 |---|---|---|---|---|---|
@@ -72,10 +74,15 @@ lore predates them:
   surface as `bloberror.BlobAlreadyExists` — match both.
 
 ### Fencing token
-The fencing token must be **blobster's own monotonic counter inside the lock
-record** (the `fence` field), bumped via CAS on every acquisition. The native
-version tokens are not usable as fences: S3/Azure ETags are opaque, and GCS
-generations are not a clean caller-facing counter.
+Fencing was evaluated and deliberately not exposed in the shipped lock. The
+native version tokens are not usable as fences: S3/Azure ETags are opaque, and
+GCS generations are not a clean caller-facing counter. blobster could maintain
+its own monotonic counter inside the lock record, bumped via CAS on every
+acquisition, but that token would only help resources that also perform
+fence-checking. The v0.1 lock instead documents an honest lease/liveness contract;
+callers that protect a single blob should use that object's own `IfMatch`
+precondition, and callers protecting external systems must make effects
+idempotent.
 
 ### Azure native lease vs uniform CAS
 Azure has a first-class **Lease Blob** API (acquire/renew/change/release/break,
@@ -112,9 +119,9 @@ which only makes sense if the transfer is server-to-server.
 | **GCS** | `rewrite` | **Sync-poll** (`rewriteToken` loop) | Single call when same-location/class; multi-call otherwise |
 | **Azure** | `Copy Blob` | **Asynchronous** (copy-id + status poll) | Any size; sync `CopyFromURL` ≤256 MiB, `Put Block From URL` for larger |
 
-The three shapes (sync / sync-poll / async) are why the `xcopy` API returns a
-`CopyOperation` handle with `Wait`/`Poll`; the handle must treat "already
-complete on return" (S3) as a first-class case.
+The three shapes (sync / sync-poll / async) are why `CrossRegionCopier.XCopyFrom`
+returns a `CopyOperation` handle with `Done`/`Err`; the handle must treat
+"already complete on return" (S3) as a first-class case.
 
 ### Go SDK surfaces
 - **S3**: `client.CopyObject(ctx, &s3.CopyObjectInput{Bucket, Key, CopySource})`;
@@ -149,9 +156,10 @@ complete on return" (S3) as a first-class case.
 ## 3. Multipart / parallel upload
 
 All three can upload a large object as concurrent parts, but only S3 has a
-native upload-id/part/complete/abort model. The proposed `MultipartUploader`
-interface is S3-shaped, and **three of its four concepts do not exist natively on
-GCS or Azure** — so the interface must be defined in backend-honest terms.
+native upload-id/part/complete/abort model. The future `MultipartUploader`
+interface will be S3-shaped, and **three of its four concepts do not exist
+natively on GCS or Azure** — so the interface must be defined in backend-honest
+terms.
 
 | Interface concept | S3 | GCS | Azure |
 |---|---|---|---|

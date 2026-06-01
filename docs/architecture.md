@@ -7,11 +7,11 @@ it describes. For how we work on the project see [`../AGENTS.md`](../AGENTS.md);
 for the planning backlog see [`roadmap.md`](roadmap.md); committed work lives in
 GitHub issues.
 
-This describes both the implemented foundation and the **target** architecture.
-The base `Bucket` API, shared conformance tests, and the `mem`, `file`, `gcs`,
-`s3`, and `azureblob` drivers are implemented, as are the lease lock, cross-region
-copy, and the blob-backed work queue. The remaining higher-level utilities
-(multipart) are planned. The
+This describes both the implemented v0.1 initial release surface and the **target**
+architecture. The base `Bucket` API, shared conformance tests, and the `mem`,
+`file`, `gcs`, `s3`, and `azureblob` drivers are implemented, as are the lease
+lock, cross-region copy, and the blob-backed work queue. The remaining
+higher-level utility (multipart parallel upload) is planned. The
 **backend API facts** the design depends on —
 conditional writes, cross-region copy, multipart — are verified against the
 providers' docs and Go SDKs; the evidence and exact API surfaces live in
@@ -46,8 +46,8 @@ goal above — see the invariants.
 
 These hold across the whole system; everything below is built to preserve them.
 
-1. **Blob storage is the only dependency.** Every utility — lock, multipart,
-   cross-region copy, a future queue — is expressible as blob operations plus
+1. **Blob storage is the only dependency.** Every utility — lock, queue,
+   cross-region copy, and planned multipart — is expressible as blob operations plus
    one conditional-write primitive. There is no external coordinator (no
    ZooKeeper, etcd, Redis, or database). In-memory state (caches, a lock's
    local lease timer) is allowed but must be reconstructible from the bucket.
@@ -65,8 +65,10 @@ These hold across the whole system; everything below is built to preserve them.
    caller supplies is relative to that root, and `Sub(prefix)` returns another
    `Bucket` rooted deeper. A caller can therefore treat any subtree of a
    physical bucket as an independent blobster bucket. blobster's own bookkeeping
-   objects (lock records, multipart state) live under a single reserved prefix
-   (`.blobster/`) beneath the root so they never collide with caller keys.
+   objects (lock records, and planned multipart state) live under a reserved
+   prefix (`.blobster/`) beneath the root. That prefix is reserved by convention:
+   callers must not store application data there. The queue is the deliberate
+   exception; it owns a caller-supplied prefix instead of `.blobster/`.
 4. **Capabilities are explicit and discoverable.** The base `Bucket` interface
    is the common denominator that *every* driver implements. Anything a backend
    may or may not support is modeled as an **optional interface** plus a
@@ -77,8 +79,8 @@ These hold across the whole system; everything below is built to preserve them.
 5. **Conditional writes are the one coordination primitive.** Optimistic
    concurrency — "write/delete this key only if it is absent / only if its
    current version matches" — is the single mechanism on which all coordination
-   (the lock today, a queue later) is built. Every production driver must
-   provide it; the implemented `mem`, `file`, `gcs`, and `s3` drivers all
+   (the lock and queue today) is built. Every production driver must provide it;
+   the implemented `mem`, `file`, `gcs`, `s3`, and `azureblob` drivers all
    provide it. `file` emulates it with an atomic write-temp + rename committed
    under a per-bucket lock.
 6. **`mem` and `file` are first-class, not test doubles.** They implement the
@@ -217,49 +219,48 @@ removing it would be the breaking change.
 
 ## Optional capabilities
 
-Each future optional capability is a Go interface a driver may also implement,
-paired with a flag in the `Capabilities` descriptor for runtime introspection.
-Callers obtain future optional capabilities by type assertion:
+Optional capabilities are Go interfaces a driver may also implement, paired
+where useful with a flag in the `Capabilities` descriptor for runtime
+introspection. Callers obtain them by type assertion:
 
 ```go
-if mu, ok := bucket.(blobster.MultipartUploader); ok { /* use native multipart */ }
+if xc, ok := bucket.(blobster.CrossRegionCopier); ok {
+	op, err := xc.XCopyFrom(ctx, "dst", srcBucket, "src", nil)
+	// observe op.Done() / op.Err()
+	_ = err
+	_ = op
+}
 ```
 
-- **`MultipartUploader`** — `NewMultipartUpload`, `UploadPart` (the parts are
-  uploaded concurrently by the `multipart` helper), `CompleteMultipartUpload`,
-  `AbortMultipartUpload`. Native on S3 (UploadPart), GCS (resumable upload /
-  compose), Azure (Put Block + Block List). `mem`/`file` provide a simple local
-  implementation so the helper works everywhere.
-- **`CrossRegionCopier`** — initiates a backend-native copy that may target a
-  different region/bucket and returns a `CopyOperation` handle (some backends
-  copy synchronously, some asynchronously — see below).
-- **Signed URLs** are exposed on the base bucket because Go Cloud exposes them as
-  a basic bucket operation. Drivers that cannot sign return `ErrUnsupported` and
-  set `Capabilities().SignedURL` to false. The GCS driver supports signed URLs
-  when constructed with `gcs.WithSignedURLs`; the S3 driver always supports them
-  via the SDK presigner (GET/PUT/DELETE), so `mem` and `file` are the only
-  drivers without signing.
-- **`Pinger`** — a cheap reachability probe for readiness checks.
+- **`CrossRegionCopier`** is implemented today by `s3`, `gcs`, and `azureblob`.
+  It initiates a backend-native copy that may target a different
+  region/bucket/account and returns a `CopyOperation` handle (some backends copy
+  synchronously, some asynchronously — see below).
+- **Signed URLs** are exposed on the base `Bucket` because Go Cloud exposes them
+  as a basic bucket operation. Drivers that cannot sign return `ErrUnsupported`
+  and set `Capabilities().SignedURL` to false. The GCS driver supports signed
+  URLs when constructed with `gcs.WithSignedURLs`; the S3 driver supports them
+  via the SDK presigner (GET/PUT/DELETE); the Azure driver supports SAS URLs
+  when its container client can sign them. `mem` and `file` do not sign.
+- **Planned:** `MultipartUploader` and `Pinger` are backlog capabilities, not
+  exported v0.1 APIs. When they ship, the optional interface will be the
+  load-bearing mechanism and `Capabilities` will grow additively.
 
 `Capabilities` is a small struct of booleans (`ConditionalWrites`, `Copy`,
-`List`, `ListPage`, `RangeRead`, `SignedURL`, and future multipart/cross-region
-flags). For future optional interfaces, the interface is the load-bearing
-mechanism; the descriptor exists so code can branch, log, or fail fast without a
-type assertion per capability.
+`List`, `ListPage`, `RangeRead`, `SignedURL`, `CrossRegionCopy`). It exists so
+code can branch, log, or fail fast without a type assertion per capability.
 
-### Capability matrix (target)
+### Capability matrix (implemented)
 
-| Capability         | `mem` | `file` | `s3` | `gcs` | `azureblob` |
-|--------------------|:-----:|:------:|:----:|:-----:|:-------:|
-| Base `Bucket`      |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
-| `ConditionalWrites`|  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
-| `MultipartUploader`|  ✅¹  |  ✅¹   | ✅   |  ✅   |  ✅     |
-| `CrossRegionCopier`|  ❌   |  ❌    | ✅   |  ✅   |  ✅     |
-| Signed URLs        |  ❌   |  ❌    | ✅   |  ✅²  |  ✅     |
-| `Pinger`           |  ✅   |  ✅    | ✅   |  ✅   |  ✅     |
-
-¹ local (non-native) implementation — correct, but not a true server-side
-multipart. ² requires `gcs.WithSignedURLs`.
+| Capability          | `mem` | `file` | `s3` | `gcs` | `azureblob` |
+|---------------------|:-----:|:------:|:----:|:-----:|:-----------:|
+| Base `Bucket`       | yes   | yes    | yes  | yes   | yes         |
+| Conditional writes  | yes   | yes    | yes  | yes   | yes         |
+| Copy                | yes   | yes    | yes  | yes   | yes         |
+| List / ListPage     | yes   | yes    | yes  | yes   | yes         |
+| Range reads         | yes   | yes    | yes  | yes   | yes         |
+| Signed URLs         | no    | no     | yes  | opt-in | yes        |
+| Cross-region copy   | no    | no     | yes  | yes   | yes         |
 
 `mem` and `file` deliberately do **not** implement `CrossRegionCopier`: there is
 no region to cross and no server-side transfer to orchestrate, so synthesizing
@@ -403,8 +404,8 @@ permission details.
 A lock is a **generic lease algorithm over one conditional-write primitive**,
 not per-driver code. The lock lives in the **root `blobster` package** (it is a
 core coordination primitive and depends only on the root contract, so it is
-surfaced at the top level rather than in its own folder, unlike the heavier,
-capability-gated `multipart` utility). A `Locker` is constructed with
+surfaced at the top level rather than in its own folder, unlike the planned
+heavier, capability-gated `multipart` utility). A `Locker` is constructed with
 `blobster.NewLocker(bucket, …)` over any `blobster.Bucket` that advertises
 `ConditionalWrites`, so a caller builds a native client once and uses the same
 driver for both blob operations and locking. Internally the lease logic needs
@@ -488,27 +489,28 @@ uniformly across backends — see
 
 ## Multipart parallel upload
 
-The `multipart` package is a generic helper over the `MultipartUploader`
-capability. Given a large source and options (`PartSize`, `Concurrency`), it
-splits the source into parts, uploads them with bounded parallelism, and
-completes the upload — aborting and cleaning up parts on any error or context
-cancellation so a failed upload leaves no orphaned multipart state. Where the
-backend lacks native multipart (`mem`/`file`), the local implementation behind
-the same interface keeps the helper usable in tests and for small/local
-deployments. Resumable uploads (persisting an upload id for later continuation)
-are a backlog item, not part of the first cut.
+The multipart helper is **planned**, not part of the v0.1 API. The
+intended shape is a `multipart` package over a future `MultipartUploader`
+optional capability. Given a large source and options (`PartSize`,
+`Concurrency`), it will split the source into parts, upload them with bounded
+parallelism, and complete the upload — aborting and cleaning up parts on any
+error or context cancellation so a failed upload leaves no orphaned multipart
+state. Where the backend lacks native multipart (`mem`/`file`), a local
+implementation behind the same interface should keep the helper usable in tests
+and for small/local deployments. Resumable uploads (persisting an upload id for
+later continuation) are a backlog item beyond the initial helper.
 
 **The interface is backend-honest, not S3-mirrored.** Only S3 has a native
 upload-id / part / complete / abort model. GCS uses **compose** (parallel
 composite upload over temp components placed under `.blobster/multipart/`; the
 S3-compatible XML multipart API is unavailable in the Go SDK, so blobster does
 not use it), and Azure uses **block blobs** (`StageBlock` + `CommitBlockList`).
-Consequently `uploadID` and the per-part token are **blobster-owned opaque
-values** — real handles on S3, synthesized on GCS/Azure — and `Abort` is
-**best-effort cleanup**: S3 calls the real abort, GCS deletes its temp
-components, Azure relies on uncommitted-block GC. Azure offers no per-upload
-isolation on a key, so part/block ids are namespaced by `uploadID`. Per-backend
-mechanisms and limits are in
+Consequently the future `uploadID` and per-part token should be
+**blobster-owned opaque values** — real handles on S3, synthesized on GCS/Azure —
+and `Abort` should be **best-effort cleanup**: S3 calls the real abort, GCS
+deletes its temp components, Azure relies on uncommitted-block GC. Azure offers
+no per-upload isolation on a key, so part/block ids would be namespaced by
+`uploadID`. Per-backend mechanisms and limits are in
 [`cloud-backend-research.md`](cloud-backend-research.md).
 
 ## Cross-region copy
@@ -602,11 +604,12 @@ and the copy fails for the same reason a signed URL would. Same-account copies a
 the **destination** client have no such requirement (the destination client only
 issues `Copy Blob`).
 
-The token-credential gap is a **future cross-cutting enhancement, not an
-xcopy-specific one**: signing from an Entra ID credential needs a *user-delegation
-key* (`GetUserDelegationCredential`, plus the "Storage Blob Delegator" RBAC role),
-which the current `SignedURL` does not implement either. Adding it would light up
-both signed URLs and cross-account copy at once; it is tracked in the roadmap.
+The token-credential gap is a **future cross-cutting enhancement, not a
+cross-region-copy-specific one**: signing from an Entra ID credential needs a
+*user-delegation key* (`GetUserDelegationCredential`, plus the "Storage Blob
+Delegator" RBAC role), which the current `SignedURL` does not implement either.
+Adding it would light up both signed URLs and cross-account copy at once; it is
+tracked in the roadmap.
 
 **Verified constraints** (see [`cloud-backend-research.md`](cloud-backend-research.md)):
 cross-region copy is genuinely server-side on all three, but S3's only works
@@ -836,27 +839,27 @@ blobster/            ← root package: Bucket + optional capability interfaces,
                        blob-backed work queue (Queue, Message, NewQueue over a
                        Bucket), and the cross-region copy handle (CopyOperation,
                        StartCopyOperation) backing the CrossRegionCopier capability
-multipart/           ← parallel-upload helper over MultipartUploader
+blobtest/            ← shared conformance suite for Bucket implementations
 mem/                 ← in-memory driver (reference implementation + test substrate)
 file/                ← filesystem driver (local integration + small deployments)
 s3/                  ← AWS S3 driver (wraps a caller-owned *s3.Client)
 gcs/                 ← Google Cloud Storage driver (wraps *storage.Client)
 azureblob/           ← Azure Blob driver (wraps the container client)
-internal/            ← shared etag/condition plumbing, not part of the public API
 docs/
   architecture.md    ← this document
   roadmap.md         ← planning backlog
   cloud-backend-research.md  ← verified backend API facts behind the design
 AGENTS.md            ← how we work  (CLAUDE.md is a symlink to it)
-README.md  LICENSE  go.mod  Makefile
+README.md  LICENSE  go.mod  go.sum
 ```
+
+There is no `multipart/` package in the v0.1 initial release. When the multipart
+helper ships, it should live in its own package and depend only on root
+interfaces.
 
 ### Dependency rule
 
 ```
-                     multipart/             (utility: depends on root interfaces only)
-                         │
-                         ▼
    blobster (root: interfaces + types + lease lock + work queue + cross-region copy handle)
                          ▲
                          │
@@ -867,26 +870,27 @@ README.md  LICENSE  go.mod  Makefile
 - The lease lock and the work queue live in the root package; each depends only
   on the root contract (no driver imports), so surfacing them at the top level
   keeps the dependency graph one-directional.
-- The `multipart` utility package depends on the root **interfaces**, never on a
-  concrete driver — so it works against any backend that advertises the needed
-  capability. Cross-region copy is not a utility package: its capability
-  (`CrossRegionCopier`) is implemented directly on each cloud driver and its
-  handle (`CopyOperation`) lives in root, mirroring the lock.
+- The planned `multipart` utility package will depend on the root **interfaces**,
+  never on a concrete driver — so it works against any backend that advertises
+  the needed capability. Cross-region copy is not a utility package: its
+  capability (`CrossRegionCopier`) is implemented directly on each cloud driver
+  and its handle (`CopyOperation`) lives in root, mirroring the lock.
 - No driver imports another driver. The arrows point one way.
 
 ## Reserved keys and the root prefix
 
 A blobster bucket is rooted at a prefix; all caller keys are relative to it.
-blobster's own objects live under a single reserved sub-prefix so they are
-invisible to and uncollidable with caller data:
+blobster's own objects live under a reserved sub-prefix by convention:
 
 ```
 <root>/<caller keys…>
 <root>/.blobster/locks/<name>          ← lock records
-<root>/.blobster/multipart/<id>/…      ← in-flight multipart bookkeeping (where emulated)
+<root>/.blobster/multipart/<id>/…      ← planned in-flight multipart bookkeeping (where emulated)
 ```
 
-Listing the bucket's caller-visible contents excludes the `.blobster/` subtree.
+Callers must not store application data under `.blobster/`. The drivers do not
+hide or reject that prefix today; it is reserved so blobster utilities have a
+well-known namespace that avoids collisions when callers respect the convention.
 `Sub(prefix)` composes prefixes, and each re-rooted bucket gets its own
 `.blobster/` namespace beneath its root.
 
@@ -919,6 +923,9 @@ internally and adds `ErrNoMessages`, `ErrMessageLost`, and
   single-object conditional writes; there is no multi-key transaction.
 - **A POSIX filesystem.** No partial in-place edits, no rename-as-move
   semantics beyond what `Copy` + `Delete` express.
+- **Multipart parallel-upload helper** — backlog. The cloud drivers use their
+  native streaming upload paths today, but there is no public `multipart`
+  package or `MultipartUploader` interface yet.
 - **Resumable multipart** (persisting an upload id across processes) — backlog.
 - **Redirecting dead letters to a separate queue** (`WithDeadLetterQueue`) — the
   in-prefix `dead/` sub-prefix is the only target for now; redirect is a deferred,
