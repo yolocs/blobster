@@ -1051,6 +1051,68 @@ func TestQueueDeadLetterAtThreshold(t *testing.T) {
 	})
 }
 
+// TestQueueDeadLetterLargePayloadStreamed pins the reason the dead-letter move
+// streams the payload instead of using a server-side Copy: a multi-megabyte
+// payload must round-trip onto the dead record intact (and, structurally, without
+// the move buffering the whole body), with the user attributes and final receive
+// count preserved.
+func TestQueueDeadLetterLargePayloadStreamed(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithQueueVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(time.Hour),
+			blobster.WithMaxReceives(1),
+		)
+		payload := bytes.Repeat([]byte("blobster-"), 700*1024) // ~6 MiB
+		id, err := q.Enqueue(ctx, bytes.NewReader(payload), &blobster.EnqueueOptions{
+			Attributes: map[string]string{"kind": "bulk"},
+		})
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+
+		// One delivery brings the count to the threshold; the next claim dead-letters.
+		if _, err := q.TryReceive(ctx); err != nil {
+			t.Fatalf("first receive: %v", err)
+		}
+		clock.Advance(31 * time.Second)
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("claim past threshold: got %v, want ErrNoMessages", err)
+		}
+
+		// The large payload survives the streamed move byte-for-byte on the dead
+		// record, with attributes and the final receive count.
+		deadAttrs, err := bucket.Attributes(ctx, "jobs/dead/"+id)
+		if err != nil {
+			t.Fatalf("dead record attributes: %v", err)
+		}
+		if got := deadAttrs.Metadata["kind"]; got != "bulk" {
+			t.Errorf("dead record kind = %q, want bulk", got)
+		}
+		if got := deadAttrs.Metadata["receives"]; got != "1" {
+			t.Errorf("dead record receives = %q, want 1", got)
+		}
+		r, err := bucket.NewReader(ctx, "jobs/dead/"+id, nil)
+		if err != nil {
+			t.Fatalf("open dead record: %v", err)
+		}
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("read dead record: %v", err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("close dead record: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("dead payload round-trip mismatch: got %d bytes, want %d", len(got), len(payload))
+		}
+	})
+}
+
 // TestQueueMaxReceivesDisabledRedeliversForever verifies the default (unset /
 // zero) disables dead-lettering: a message keeps being redelivered with a growing
 // receive count and never moves to dead/.

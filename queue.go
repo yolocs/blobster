@@ -153,6 +153,10 @@ func WithQueueClock(now func() time.Time) QueueOption {
 //
 // n <= 0 (the default) disables dead-lettering: a poison message is redelivered
 // forever, and the caller can implement its own policy from Message.Receives.
+//
+// The dead record carries the payload's user attributes plus the final receive
+// count under the reserved metadata key "receives"; a caller attribute of that
+// name is shadowed on the dead record only (see EnqueueOptions.Attributes).
 func WithMaxReceives(n int) QueueOption {
 	return func(q *Queue) { q.maxReceives = n }
 }
@@ -218,6 +222,13 @@ type EnqueueOptions struct {
 	// the receiver via Message.Attributes. They are set once at enqueue and never
 	// touched again, so they never clash with the lease state on the separate
 	// lease object.
+	//
+	// One reserved name applies only when dead-lettering is enabled
+	// (WithMaxReceives): the dead record merges the final receive count into a
+	// copy of these attributes under the key "receives", so an attribute literally
+	// named "receives" is shadowed by the count on the dead record (the live
+	// Message.Attributes is unaffected). Avoid that name if you enable
+	// dead-lettering and need it preserved verbatim on dead records.
 	Attributes map[string]string
 }
 

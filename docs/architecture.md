@@ -608,8 +608,10 @@ heartbeat rewrites only the tiny, empty-bodied lease record — so payloads stre
 at any size with no buffering (honoring "stream, don't buffer"), and the renew
 path is **exactly the lock's**. Because user attributes live on the payload
 object and lease state on the separate lease object, there is no
-reserved-metadata clash between them. This needs **no new interface primitive and
-touches no shipped behavior**.
+reserved-metadata clash between them in the live message. (The dead record is the
+one place the two are merged onto a single object, where the receive count
+reserves the `receives` metadata key — see [Dead-letter](#dead-letter--max-receives).)
+This needs **no new interface primitive and touches no shipped behavior**.
 
 ```dot
 digraph queue {
@@ -695,8 +697,11 @@ but copies only the source object's own metadata — the payload's user attribut
 not the lease's `receives` — and the interface has no body-free metadata write. To
 land the payload, its user attributes, *and* the final receive count in one
 self-describing dead record, the move streams the payload into `dead/<id>` with
-`receives` merged into the metadata (reserving the `receives` metadata key on the
-dead record). This still honors "stream, don't buffer" — it never materializes the
+`receives` merged into the metadata. This reserves the `receives` metadata key on
+the dead record: a caller attribute of that name is shadowed by the count there
+(documented on `WithMaxReceives` / `EnqueueOptions.Attributes`), the one merge
+point the live msg/lease split otherwise avoids. This still honors "stream, don't
+buffer" — it never materializes the
 whole body — at the cost of routing the bytes through the mover rather than a pure
 server-side transfer. For the rare, terminal poison path that trade is worth a
 single self-describing record and no new interface primitive; a future
