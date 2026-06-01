@@ -10,18 +10,19 @@ the backlog, issues, and design doc relate.
 
 ## Direction
 
-The first useful shape of blobster is: the base `Bucket` interface, all five
-drivers (`mem`, `file`, `s3`, `gcs`, `azure`), and the three headline utilities
-(distributed lock, multipart parallel upload, cross-region copy) built on the
-conditional-write primitive. The `mem`/`file` drivers come first because they
-pin the interface and are the test substrate everything else relies on.
+The v0.1 initial release shape is: the base `Bucket` interface, all five drivers
+(`mem`, `file`, `s3`, `gcs`, `azureblob`), and three blob-backed utilities built
+on the conditional-write primitive: distributed lock, cross-region copy, and a
+work queue. The remaining headline utility is multipart parallel upload. The
+backlog below tracks that planned helper and additive hardening around the
+shipped surface.
 
 ## Themes
 
 ### Foundation
 - The root package: `Bucket` interface, `Attributes`, `Precondition`/conditions,
-  sentinel errors, `Capabilities` descriptor, and the optional-capability
-  interface definitions.
+  sentinel errors, `Capabilities` descriptor, `Locker`, `Queue`,
+  `CrossRegionCopier`, and `CopyOperation`.
 - `mem` driver — in-memory reference implementation with full conditional
   semantics; the substrate for unit tests.
 - `file` driver — filesystem-backed, atomic writes and conditional semantics via
@@ -32,7 +33,7 @@ pin the interface and are the test substrate everything else relies on.
   `If-None-Match`/`If-Match`, native multipart, server-side copy, signed URLs).
 - `gcs` driver (generation preconditions, resumable upload/compose, rewrite,
   signed URLs).
-- `azure` driver (ETag preconditions, block upload, async Copy Blob, SAS URLs).
+- `azureblob` driver (ETag preconditions, block upload, async Copy Blob, SAS URLs).
 - A shared conformance test suite every driver must pass, run against `mem`/
   `file` by default and real backends behind a build tag.
 
@@ -47,8 +48,9 @@ pin the interface and are the test substrate everything else relies on.
   driver for both blob ops and locking.
 
 ### Multipart parallel upload
-- Generic helper over `MultipartUploader`: split, upload parts with bounded
-  concurrency, complete, and abort/clean up on failure or cancellation.
+- Define a `MultipartUploader` optional capability and a generic helper over it:
+  split, upload parts with bounded concurrency, complete, and abort/clean up on
+  failure or cancellation. This public interface/package does not exist yet.
 - Tunable part size and concurrency; sensible per-backend defaults.
 
 ### Cross-region copy
@@ -75,7 +77,8 @@ pin the interface and are the test substrate everything else relies on.
     sign neither a URL nor a cross-account copy SAS today. Closing this needs the
     *user-delegation key* flow (`GetUserDelegationCredential` + the "Storage Blob
     Delegator" role); it is a cross-cutting enhancement that would light up both
-    `SignedURL` and cross-account `XCopyFrom` at once, not an xcopy-specific one.
+    `SignedURL` and cross-account `XCopyFrom` at once, not a
+    cross-region-copy-specific one.
   - **Future opt-in — persistent / recoverable handle:** the `CopyOperation`
     handle is in-memory only by default, so a process crash loses an in-flight
     copy's outcome. A planned (not ruled-out) option is a **driver-construction
@@ -110,7 +113,9 @@ pin the interface and are the test substrate everything else relies on.
     deferred and additive.
 
 ### Cross-cutting
-- Signed/presigned URLs as a first-class capability (`SignedURLer`).
+- Signed/presigned URL hardening. `SignedURL` is already a base `Bucket`
+  operation gated by `Capabilities().SignedURL`; future work is around signing
+  modes such as Azure user-delegation keys and additional conformance coverage.
 - Observability seams (metrics/tracing hooks) that keep the root package free of
   any specific telemetry dependency.
 - Readiness probe (`Pinger`) for services embedding blobster.

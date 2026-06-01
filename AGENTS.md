@@ -8,11 +8,11 @@ codebase. It is deliberately high level. The detailed design lives in
 blobster is a Go library of **cloud-agnostic utilities built solely on blob
 storage**. It models a blob backend as a flat keyspace of string keys — read,
 write, list, delete, attributes, server-side copy — and layers higher utilities
-on that one substrate: parallel multipart upload, a distributed lock, and
-cross-region copy. The aim is that a service which already runs an object store
-needs *nothing else* — no separate lock service, no queue broker, no metadata
-database — to get these primitives. Read `docs/architecture.md` before making
-non-trivial changes.
+on that one substrate: a distributed lock, cross-region copy, a blob-backed
+work queue, and planned parallel multipart upload. The aim is that a service
+which already runs an object store needs *nothing else* — no separate lock
+service, no queue broker, no metadata database — to get these primitives. Read
+`docs/architecture.md` before making non-trivial changes.
 
 ## Think from first principles
 
@@ -66,19 +66,21 @@ not buried in a commit message or an issue comment.
   closes a client it did not open. The caller stays in full control of how the
   native client is configured (endpoints, credentials, retry, timeouts).
 - **Respect the dependency rule.** The root `blobster` package defines the
-  interfaces and shared types; drivers (`mem`, `file`, `s3`, `gcs`, `azure`)
-  import only the root package; the utility packages (`lock`, `multipart`,
-  `xcopy`) depend on the root interfaces, never on a concrete driver; and no
-  driver imports another. The arrows point one way.
+  interfaces, shared types, the lease lock, the work queue, and the
+  cross-region copy handle; drivers (`mem`, `file`, `s3`, `gcs`, `azureblob`)
+  import only the root package; the planned `multipart` utility will depend on
+  the root interfaces, never on a concrete driver; and no driver imports
+  another. The arrows point one way.
 - **Capabilities are explicit; never assume one.** The base `Bucket` interface
   is the common denominator. Anything a backend may or may not support is an
   optional interface plus a `Capabilities()` descriptor. Feature-gate by
   type-asserting the optional interface or checking the descriptor — never call
   a capability you have not confirmed.
-- **Conditional writes are the coordination primitive.** Locks and any future
-  CAS-based utility build on one optimistic-concurrency operation. Don't reach
-  for a second coordination mechanism; if blob storage can't express it with
-  conditional writes, question whether it belongs in blobster.
+- **Conditional writes are the coordination primitive.** Locks, the work queue,
+  and any future CAS-based utility build on one optimistic-concurrency
+  operation. Don't reach for a second coordination mechanism; if blob storage
+  can't express it with conditional writes, question whether it belongs in
+  blobster.
 - **Stream; don't buffer.** Blobs can be large. Prefer streaming (`io.Copy`,
   range reads, multipart parts) over `io.ReadAll` into a `[]byte`. Hash during
   the streamed write, not in a second buffered pass.
@@ -104,13 +106,13 @@ not buried in a commit message or an issue comment.
   process-global exception applies.
 - Table-driven tests for multiple inputs; compare with `cmp.Diff`.
 - Cover the hard cases: conditional-write races (two writers, `IfNotExists`),
-  lock contention, lease expiry and takeover, fencing-token monotonicity,
-  release-after-expiry safety, multipart part concurrency and abort/cleanup,
-  cross-region copy polling and cancellation, range reads, and listing with
-  delimiters.
+  lock contention, lease expiry and takeover, lost-lease signaling,
+  release-after-expiry safety, queue redelivery, Nack, max-receives
+  dead-lettering, multipart part concurrency and abort/cleanup, cross-region
+  copy polling and cancellation, range reads, and listing with delimiters.
 - Every change: `go test -race ./...`.
 
 ## Build and commit
 
-- **Build and test via the `Makefile`.**
+- Use `go test -race ./...` for the required local verification.
 - **Sign off every commit** (`git commit -s`) — we keep a DCO trail.
