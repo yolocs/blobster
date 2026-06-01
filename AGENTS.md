@@ -116,3 +116,20 @@ not buried in a commit message or an issue comment.
 
 - Use `go test -race ./...` for the required local verification.
 - **Sign off every commit** (`git commit -s`) — we keep a DCO trail.
+
+## Pull requests and labels
+
+Release notes are generated from merged PRs, bucketed by label per
+[`.github/release.yml`](.github/release.yml). **Every PR must carry exactly one
+category label** so it lands in the right section of the next release's notes:
+
+- `breaking` — backwards-incompatible API change (callers must change code).
+- `feature` / `enhancement` — new capability or improvement.
+- `fix` / `bug` — bug fix.
+- `docs` / `documentation` — documentation only.
+- `ignore-for-release` — excluded from notes entirely (e.g. CI/chore, internal
+  refactors with no user-facing effect).
+
+An unlabeled PR still ships, but falls into "Other Changes" — avoid that. Pick
+`breaking` whenever the change alters the public API surface; that section is
+the one consumers read first when deciding whether to upgrade.
