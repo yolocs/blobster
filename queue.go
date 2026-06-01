@@ -1,10 +1,69 @@
-// Package queue is a work queue built solely on blob storage: competing
-// consumers, at-least-once delivery, and approximate FIFO, with no broker, no
-// database, and no coordinator beyond the bucket's conditional-write primitive.
+package blobster
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Queue sentinel errors, matchable with errors.Is.
+var (
+	// ErrNoMessages is returned by Queue.TryReceive when no message is available
+	// to claim — the queue is empty, or every listed message is currently leased.
+	ErrNoMessages = errors.New("blobster: no messages available")
+	// ErrMessageLost reports, via a Message's Err, that its lease could not be
+	// renewed and the message is no longer held; another worker may redeliver it.
+	ErrMessageLost = errors.New("blobster: message lost")
+	// ErrInvalidQueuePrefix is returned by NewQueue when the prefix is empty or
+	// would escape its subtree.
+	ErrInvalidQueuePrefix = errors.New("blobster: invalid queue prefix")
+)
+
+// Default queue lease timing. The lease is second-scale for the same reason the
+// lock's is: GCS throttles writes to ~1/sec per object name, and the lease record
+// is a single hot object, so sub-second leases are not portable across backends.
+const (
+	DefaultVisibilityLease = 15 * time.Second
+	DefaultHeadWindow      = 256
+	DefaultMinPollInterval = 250 * time.Millisecond
+	DefaultMaxPollInterval = 5 * time.Second
+)
+
+// Sub-prefixes, relative to the queue's owned prefix, that separate the immutable
+// payloads from the mutating lease records.
+const (
+	queueMsgPrefix   = "msg/"
+	queueLeasePrefix = "lease/"
+)
+
+// Lease record field names, stored as the lease object's user metadata. They are
+// lowercase identifiers that round-trip verbatim on every backend (including the
+// escaping azureblob driver), exactly like the lock's record fields.
+const (
+	queueOwnerField    = "owner"
+	queueLeaseField    = "lease"
+	queueReceivesField = "receives"
+)
+
+// queueJitterWindow bounds how far from the head of the listing a claim attempt
+// may start. Workers iterate the head window in lexical (≈FIFO) order but begin
+// at a random offset within this front window, so they prefer the earliest
+// messages without all stampeding the single lexically-first one.
+const queueJitterWindow = 16
+
+// Queue is a work queue built solely on blob storage: competing consumers,
+// at-least-once delivery, and approximate FIFO, with no broker, database, or
+// coordinator beyond the bucket's conditional-write primitive. It is the next
+// coordination primitive after the lease lock and, like the lock, lives in the
+// root package and reuses that algorithm — here applied per message.
 //
-// It is the next coordination primitive after the lease lock and reuses the
-// lock's algorithm per message. Each message is two objects under a
-// caller-supplied prefix the queue owns wholesale:
+// Each message is two objects under a caller-supplied prefix the queue owns
+// wholesale:
 //
 //	<prefix>/msg/<id>     the payload — written once at enqueue, immutable,
 //	                      streamed at any size; user attributes live in its metadata
@@ -17,78 +76,16 @@
 //
 // The model is at-least-once: a worker that crashes mid-processing has its lease
 // expire and the message redelivered, so handlers must be idempotent — the same
-// liveness-not-safety contract the lock documents. Ordering is approximate:
-// ids are ULID-style (millisecond time plus randomness, lexically sortable),
-// and workers prefer the lexically-earliest available message, but concurrency,
-// clock skew, and redelivery make it best-effort only.
-package queue
-
-import (
-	"context"
-	crand "crypto/rand"
-	"encoding/hex"
-	"errors"
-	"fmt"
-	"io"
-	"math/rand/v2"
-	"strconv"
-	"strings"
-	"time"
-
-	"github.com/yolocs/blobster"
-)
-
-// Queue sentinel errors, matchable with errors.Is.
-var (
-	// ErrNoMessages is returned by TryReceive when no message is available to
-	// claim — the queue is empty, or every listed message is currently leased.
-	ErrNoMessages = errors.New("blobster/queue: no messages available")
-	// ErrMessageLost reports, via a Message's Err, that its lease could not be
-	// renewed and the message is no longer held; another worker may redeliver it.
-	ErrMessageLost = errors.New("blobster/queue: message lost")
-	// ErrInvalidQueuePrefix is returned by New when the prefix is empty or would
-	// escape its subtree.
-	ErrInvalidQueuePrefix = errors.New("blobster/queue: invalid queue prefix")
-)
-
-// Default lease timing. The lease is second-scale for the same reason the lock's
-// is: GCS throttles writes to ~1/sec per object name, and the lease record is a
-// single hot object, so sub-second leases are not portable across backends.
-const (
-	DefaultVisibilityLease = 15 * time.Second
-	DefaultHeadWindow      = 256
-	DefaultMinPollInterval = 250 * time.Millisecond
-	DefaultMaxPollInterval = 5 * time.Second
-)
-
-// Sub-prefixes, relative to the queue's owned prefix, that separate the immutable
-// payloads from the mutating lease records.
-const (
-	msgPrefix   = "msg/"
-	leasePrefix = "lease/"
-)
-
-// Lease record field names, stored as the lease object's user metadata. They are
-// lowercase identifiers that round-trip verbatim on every backend (including the
-// escaping azureblob driver), exactly like the lock's record fields.
-const (
-	leaseOwnerField    = "owner"
-	leaseLeaseField    = "lease"
-	leaseReceivesField = "receives"
-)
-
-// jitterWindow bounds how far from the head of the listing a claim attempt may
-// start. Workers iterate the head window in lexical (≈FIFO) order but begin at a
-// random offset within this front window, so they prefer the earliest messages
-// without all stampeding the single lexically-first one.
-const jitterWindow = 16
-
-// Queue is a blob-backed work queue rooted at one prefix of a Bucket. It is safe
-// for concurrent use; construct one per prefix with New and share it across
-// workers. The bucket must advertise ConditionalWrites.
+// liveness-not-safety contract the lock documents. Ordering is approximate: ids
+// are ULID-style (millisecond time plus randomness, lexically sortable), and
+// workers prefer the lexically-earliest available message, but concurrency, clock
+// skew, and redelivery make it best-effort only.
+//
+// A Queue is safe for concurrent use; construct one per prefix with NewQueue and
+// share it across workers. The bucket must advertise ConditionalWrites.
 type Queue struct {
-	bucket     blobster.Bucket // rooted at the queue's prefix via Sub
-	prefix     string          // the caller-supplied prefix, normalized with a trailing slash
+	bucket     Bucket // rooted at the queue's prefix via Sub
+	prefix     string // the caller-supplied prefix, normalized with a trailing slash
 	lease      time.Duration
 	renew      time.Duration
 	headWindow int
@@ -97,21 +94,21 @@ type Queue struct {
 	clock      func() time.Time
 }
 
-// Option configures a Queue.
-type Option func(*Queue)
+// QueueOption configures a Queue.
+type QueueOption func(*Queue)
 
 // WithVisibilityLease sets how long a claimed message stays invisible to other
 // workers before its lease must be renewed. A crashed worker's message becomes
 // redeliverable this long after its last successful renew. Defaults to
 // DefaultVisibilityLease.
-func WithVisibilityLease(d time.Duration) Option {
+func WithVisibilityLease(d time.Duration) QueueOption {
 	return func(q *Queue) { q.lease = d }
 }
 
-// WithRenewInterval sets how often a held message renews its lease in the
+// WithQueueRenewInterval sets how often a held message renews its lease in the
 // background. It must be comfortably shorter than the lease to absorb transient
 // backend errors and clock skew. Defaults to one third of the lease.
-func WithRenewInterval(d time.Duration) Option {
+func WithQueueRenewInterval(d time.Duration) QueueOption {
 	return func(q *Queue) { q.renew = d }
 }
 
@@ -119,37 +116,37 @@ func WithRenewInterval(d time.Duration) Option {
 // keyspace per attempt. Size it above the worker count so leased-but-unacked
 // messages — whose payloads stay listed until acked — do not crowd out available
 // ones. Defaults to DefaultHeadWindow.
-func WithHeadWindow(n int) Option {
+func WithHeadWindow(n int) QueueOption {
 	return func(q *Queue) { q.headWindow = n }
 }
 
 // WithReceiveBackoff sets the empty-queue poll backoff for the blocking Receive:
-// the wait starts at min, doubles (jittered) up to max while the queue stays
+// the wait starts at low, doubles (jittered) up to high while the queue stays
 // empty, and resets on the next claim. Defaults to DefaultMinPollInterval and
 // DefaultMaxPollInterval.
-func WithReceiveBackoff(low, high time.Duration) Option {
+func WithReceiveBackoff(low, high time.Duration) QueueOption {
 	return func(q *Queue) {
 		q.minPoll = low
 		q.maxPoll = high
 	}
 }
 
-// WithClock injects the time source used for lease deadlines and message ids,
-// mainly for tests. It should track wall-clock rate, since lease deadlines are
-// compared against it on every host. Defaults to time.Now.
-func WithClock(now func() time.Time) Option {
+// WithQueueClock injects the time source used for lease deadlines and message
+// ids, mainly for tests. It should track wall-clock rate, since lease deadlines
+// are compared against it on every host. Defaults to time.Now.
+func WithQueueClock(now func() time.Time) QueueOption {
 	return func(q *Queue) { q.clock = now }
 }
 
-// New returns a Queue that stores its messages under prefix in bucket. The prefix
-// is required — there is no default — and the queue owns it wholesale; sharding
-// past a single prefix's request-rate ceiling is the caller's composition (run N
-// queues over N prefixes). New returns ErrInvalidQueuePrefix if the prefix is
-// empty or would escape its subtree.
+// NewQueue returns a Queue that stores its messages under prefix in bucket. The
+// prefix is required — there is no default — and the queue owns it wholesale;
+// sharding past a single prefix's request-rate ceiling is the caller's
+// composition (run N queues over N prefixes). NewQueue returns
+// ErrInvalidQueuePrefix if the prefix is empty or would escape its subtree.
 //
 // Pass any blobster driver (mem, file, s3, gcs, azureblob); the queue works on
 // any bucket that advertises ConditionalWrites.
-func New(bucket blobster.Bucket, prefix string, opts ...Option) (*Queue, error) {
+func NewQueue(bucket Bucket, prefix string, opts ...QueueOption) (*Queue, error) {
 	if prefix == "" {
 		return nil, fmt.Errorf("%w: empty prefix", ErrInvalidQueuePrefix)
 	}
@@ -193,7 +190,7 @@ func New(bucket blobster.Bucket, prefix string, opts ...Option) (*Queue, error) 
 	return q, nil
 }
 
-// EnqueueOptions carries per-message options for Enqueue.
+// EnqueueOptions carries per-message options for Queue.Enqueue.
 type EnqueueOptions struct {
 	// Attributes are user metadata stored on the payload object and surfaced to
 	// the receiver via Message.Attributes. They are set once at enqueue and never
@@ -213,12 +210,12 @@ func (q *Queue) Enqueue(ctx context.Context, r io.Reader, opts *EnqueueOptions) 
 	}
 	// Retry on the astronomically unlikely id collision rather than surfacing it.
 	for attempt := 0; attempt < 3; attempt++ {
-		id, err := newID(q.clock())
+		id, err := newQueueID(q.clock())
 		if err != nil {
 			return "", err
 		}
 		err = q.writePayload(ctx, id, r, attrs)
-		if errors.Is(err, blobster.ErrPreconditionFailed) {
+		if errors.Is(err, ErrPreconditionFailed) {
 			continue
 		}
 		if err != nil {
@@ -226,15 +223,15 @@ func (q *Queue) Enqueue(ctx context.Context, r io.Reader, opts *EnqueueOptions) 
 		}
 		return id, nil
 	}
-	return "", fmt.Errorf("blobster/queue: could not allocate a unique message id")
+	return "", fmt.Errorf("blobster: could not allocate a unique message id")
 }
 
 func (q *Queue) writePayload(ctx context.Context, id string, r io.Reader, attrs map[string]string) error {
-	w, err := q.bucket.NewWriter(ctx, msgPrefix+id, &blobster.WriterOptions{
+	w, err := q.bucket.NewWriter(ctx, queueMsgPrefix+id, &WriterOptions{
 		ContentType:                 "application/octet-stream",
 		DisableContentTypeDetection: true,
 		Metadata:                    attrs,
-	}, blobster.IfNotExists)
+	}, IfNotExists)
 	if err != nil {
 		return err
 	}
@@ -269,7 +266,7 @@ func (q *Queue) Receive(ctx context.Context) (*Message, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(jitter(backoff)):
+		case <-time.After(queueJitter(backoff)):
 		}
 		if backoff < q.maxPoll {
 			backoff = min(backoff*2, q.maxPoll)
@@ -282,7 +279,7 @@ func (q *Queue) tryReceive(ctx context.Context) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	objs, _, err := q.bucket.ListPage(ctx, blobster.FirstPageToken, q.headWindow, &blobster.ListOptions{Prefix: msgPrefix})
+	objs, _, err := q.bucket.ListPage(ctx, FirstPageToken, q.headWindow, &ListOptions{Prefix: queueMsgPrefix})
 	if err != nil {
 		return nil, err
 	}
@@ -293,10 +290,10 @@ func (q *Queue) tryReceive(ctx context.Context) (*Message, error) {
 	// Prefer the head (lexically earliest ≈ oldest) but start at a jittered offset
 	// within the front window so concurrent workers do not all contend for the
 	// single first message. Wrap around so every candidate is still considered.
-	start := rand.IntN(min(len(objs), jitterWindow))
+	start := rand.IntN(min(len(objs), queueJitterWindow))
 	for i := range objs {
 		obj := objs[(start+i)%len(objs)]
-		id, ok := strings.CutPrefix(obj.Key, msgPrefix)
+		id, ok := strings.CutPrefix(obj.Key, queueMsgPrefix)
 		if !ok || id == "" {
 			continue
 		}
@@ -317,19 +314,19 @@ func (q *Queue) tryReceive(ctx context.Context) (*Message, error) {
 // on a backend failure. This is the lock's tryAcquire, plus the receives count
 // and a payload-existence check.
 func (q *Queue) tryClaim(ctx context.Context, id, owner string) (*Message, error) {
-	leasePath := leasePrefix + id
-	msgPath := msgPrefix + id
+	leasePath := queueLeasePrefix + id
+	msgPath := queueMsgPrefix + id
 
-	fields, version, err := q.getRecord(ctx, leasePath)
+	fields, version, err := q.getLease(ctx, leasePath)
 	now := q.clock()
 
 	var newVersion string
 	var receives int
 	switch {
-	case errors.Is(err, blobster.ErrNotFound):
+	case errors.Is(err, ErrNotFound):
 		receives = 1
-		newVersion, err = q.writeLease(ctx, leasePath, owner, now, receives, blobster.IfNotExists)
-		if errors.Is(err, blobster.ErrPreconditionFailed) {
+		newVersion, err = q.writeLease(ctx, leasePath, owner, now, receives, IfNotExists)
+		if errors.Is(err, ErrPreconditionFailed) {
 			return nil, nil // lost the create race to another worker
 		}
 		if err != nil {
@@ -338,12 +335,12 @@ func (q *Queue) tryClaim(ctx context.Context, id, owner string) (*Message, error
 	case err != nil:
 		return nil, err
 	default:
-		if !leaseExpired(fields, now) {
+		if !queueLeaseExpired(fields, now) {
 			return nil, nil // a live holder owns it; skip
 		}
-		receives = parseReceives(fields) + 1
-		newVersion, err = q.writeLease(ctx, leasePath, owner, now, receives, blobster.IfMatch(version))
-		if errors.Is(err, blobster.ErrPreconditionFailed) || errors.Is(err, blobster.ErrNotFound) {
+		receives = queueParseReceives(fields) + 1
+		newVersion, err = q.writeLease(ctx, leasePath, owner, now, receives, IfMatch(version))
+		if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
 			return nil, nil // someone else took over or deleted it first
 		}
 		if err != nil {
@@ -356,8 +353,8 @@ func (q *Queue) tryClaim(ctx context.Context, id, owner string) (*Message, error
 	// us to recreate just before it deleted the payload). Verify the payload still
 	// exists; if not, drop the orphan lease we just wrote and move on.
 	attrs, err := q.bucket.Attributes(ctx, msgPath)
-	if errors.Is(err, blobster.ErrNotFound) {
-		_ = q.bucket.Delete(ctx, leasePath, blobster.IfMatch(newVersion))
+	if errors.Is(err, ErrNotFound) {
+		_ = q.bucket.Delete(ctx, leasePath, IfMatch(newVersion))
 		return nil, nil
 	}
 	if err != nil {
@@ -367,9 +364,9 @@ func (q *Queue) tryClaim(ctx context.Context, id, owner string) (*Message, error
 	return q.startMessage(id, msgPath, leasePath, owner, attrs.Metadata, receives, newVersion, now.Add(q.lease)), nil
 }
 
-// getRecord reads a lease record's fields and version, returning ErrNotFound if
-// it is absent.
-func (q *Queue) getRecord(ctx context.Context, path string) (map[string]string, string, error) {
+// getLease reads a lease record's fields and version, returning ErrNotFound if it
+// is absent.
+func (q *Queue) getLease(ctx context.Context, path string) (map[string]string, string, error) {
 	attrs, err := q.bucket.Attributes(ctx, path)
 	if err != nil {
 		return nil, "", err
@@ -382,8 +379,8 @@ func (q *Queue) getRecord(ctx context.Context, path string) (map[string]string, 
 // token, so it is read back for the next compare-and-swap; we hold the record at
 // this point (a create or CAS just succeeded within the lease), so the read
 // cannot observe a foreign write.
-func (q *Queue) writeLease(ctx context.Context, path, owner string, now time.Time, receives int, precondition blobster.Precondition) (string, error) {
-	opts := &blobster.WriterOptions{Metadata: q.record(owner, now, receives), DisableContentTypeDetection: true}
+func (q *Queue) writeLease(ctx context.Context, path, owner string, now time.Time, receives int, precondition Precondition) (string, error) {
+	opts := &WriterOptions{Metadata: q.leaseRecord(owner, now, receives), DisableContentTypeDetection: true}
 	if err := q.bucket.WriteAll(ctx, path, nil, opts, precondition); err != nil {
 		return "", err
 	}
@@ -394,19 +391,19 @@ func (q *Queue) writeLease(ctx context.Context, path, owner string, now time.Tim
 	return attrs.Version, nil
 }
 
-func (q *Queue) record(owner string, now time.Time, receives int) map[string]string {
+func (q *Queue) leaseRecord(owner string, now time.Time, receives int) map[string]string {
 	return map[string]string{
-		leaseOwnerField:    owner,
-		leaseLeaseField:    now.Add(q.lease).Format(time.RFC3339Nano),
-		leaseReceivesField: strconv.Itoa(receives),
+		queueOwnerField:    owner,
+		queueLeaseField:    now.Add(q.lease).Format(time.RFC3339Nano),
+		queueReceivesField: strconv.Itoa(receives),
 	}
 }
 
-// leaseExpired reports whether a lease record's deadline is at or before now. A
-// record with a missing or unparseable lease is treated as expired so a malformed
-// record can always be recovered, mirroring the lock.
-func leaseExpired(fields map[string]string, now time.Time) bool {
-	raw, ok := fields[leaseLeaseField]
+// queueLeaseExpired reports whether a lease record's deadline is at or before now.
+// A record with a missing or unparseable lease is treated as expired so a
+// malformed record can always be recovered, mirroring the lock.
+func queueLeaseExpired(fields map[string]string, now time.Time) bool {
+	raw, ok := fields[queueLeaseField]
 	if !ok {
 		return true
 	}
@@ -417,28 +414,21 @@ func leaseExpired(fields map[string]string, now time.Time) bool {
 	return !now.Before(until)
 }
 
-// parseReceives reads the receives count from a lease record, treating a missing
-// or malformed value as zero so a takeover still increments to a sane count.
-func parseReceives(fields map[string]string) int {
-	n, err := strconv.Atoi(fields[leaseReceivesField])
+// queueParseReceives reads the receives count from a lease record, treating a
+// missing or malformed value as zero so a takeover still increments to a sane
+// count.
+func queueParseReceives(fields map[string]string) int {
+	n, err := strconv.Atoi(fields[queueReceivesField])
 	if err != nil || n < 0 {
 		return 0
 	}
 	return n
 }
 
-func jitter(d time.Duration) time.Duration {
+func queueJitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
 	}
 	// Full jitter in [d, 2d) to spread contenders off the hot keyspace.
 	return d + time.Duration(rand.Int64N(int64(d)))
-}
-
-func randomOwner() (string, error) {
-	var buf [16]byte
-	if _, err := crand.Read(buf[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf[:]), nil
 }

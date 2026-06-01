@@ -20,16 +20,16 @@ type bucketFactory struct {
 	make func(t *testing.T) blobster.Bucket
 }
 
-func lockBuckets() []bucketFactory {
+func realBuckets() []bucketFactory {
 	return []bucketFactory{
 		{name: "mem", make: func(t *testing.T) blobster.Bucket { return mem.New() }},
 		{name: "file", make: func(t *testing.T) blobster.Bucket { return file.New(t.TempDir()) }},
 	}
 }
 
-func eachLockBucket(t *testing.T, fn func(t *testing.T, bucket blobster.Bucket)) {
+func eachBucket(t *testing.T, fn func(t *testing.T, bucket blobster.Bucket)) {
 	t.Helper()
-	for _, f := range lockBuckets() {
+	for _, f := range realBuckets() {
 		t.Run(f.name, func(t *testing.T) {
 			t.Parallel()
 			fn(t, f.make(t))
@@ -37,23 +37,23 @@ func eachLockBucket(t *testing.T, fn func(t *testing.T, bucket blobster.Bucket))
 	}
 }
 
-// lockClock is a manually advanced clock for deterministic lease/expiry tests.
-type lockClock struct {
+// manualClock is a manually advanced clock for deterministic lease/expiry tests.
+type manualClock struct {
 	mu sync.Mutex
 	t  time.Time
 }
 
-func newLockClock() *lockClock {
-	return &lockClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+func newManualClock() *manualClock {
+	return &manualClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 }
 
-func (c *lockClock) Now() time.Time {
+func (c *manualClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.t
 }
 
-func (c *lockClock) Advance(d time.Duration) {
+func (c *manualClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.t = c.t.Add(d)
@@ -88,7 +88,7 @@ func (f *faultBucket) WriteAll(ctx context.Context, key string, p []byte, opts *
 
 func TestLockerAcquireReleaseReacquire(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket)
 
@@ -120,7 +120,7 @@ func TestLockerAcquireReleaseReacquire(t *testing.T) {
 
 func TestLockerDistinctKeysIndependent(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket)
 
@@ -143,7 +143,7 @@ func TestLockerDistinctKeysIndependent(t *testing.T) {
 
 func TestLockerConcurrentTryAcquireSingleWinner(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket)
 
@@ -191,9 +191,9 @@ func TestLockerConcurrentTryAcquireSingleWinner(t *testing.T) {
 
 func TestLockerTakeoverAfterExpiry(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		clock := newLockClock()
+		clock := newManualClock()
 		// Renew interval far in the future so the holder never self-renews; we
 		// drive expiry purely via the clock.
 		l := blobster.NewLocker(bucket,
@@ -238,7 +238,7 @@ func TestLockerTakeoverAfterExpiry(t *testing.T) {
 
 func TestLockerMalformedRecordRecoverable(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket)
 
@@ -264,7 +264,7 @@ func TestLockerMalformedRecordRecoverable(t *testing.T) {
 
 func TestLockerDefaultOwnersUnique(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket)
 
@@ -290,14 +290,14 @@ func TestLockerDefaultOwnersUnique(t *testing.T) {
 
 func TestLockerRenewKeepsLockHeld(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		// Freeze the clock so the lease can never lapse from wall-clock timing:
 		// this isolates "the renewer runs and successfully CASes" from any
 		// expiry race, which is what makes the test deterministic under -race,
 		// parallel load, and file fsync. We prove renewal by observing the
 		// record's version advance while the lock stays held.
-		clock := newLockClock()
+		clock := newManualClock()
 		l := blobster.NewLocker(bucket,
 			blobster.WithLockClock(clock.Now),
 			blobster.WithLeaseDuration(30*time.Second),
@@ -344,7 +344,7 @@ func TestLockerRenewKeepsLockHeld(t *testing.T) {
 
 func TestLockerRenewSurvivesTransientError(t *testing.T) {
 	t.Parallel()
-	clock := newLockClock()
+	clock := newManualClock()
 	fb := &faultBucket{Bucket: mem.New()}
 	l := blobster.NewLocker(fb,
 		blobster.WithLockClock(clock.Now),
@@ -411,12 +411,12 @@ func TestLockerSurfacesBackendError(t *testing.T) {
 
 func TestLockerLostNotification(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		// Freeze the clock so the lease cannot lapse: the only way to lose the
 		// lock here is the compare-and-swap failing because the record changed,
 		// which is the path we want to assert (not an incidental expiry).
-		clock := newLockClock()
+		clock := newManualClock()
 		l := blobster.NewLocker(bucket,
 			blobster.WithLockClock(clock.Now),
 			blobster.WithLeaseDuration(30*time.Second),
@@ -449,9 +449,9 @@ func TestLockerLostNotification(t *testing.T) {
 
 func TestLockerReleaseAfterLoss(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		clock := newLockClock()
+		clock := newManualClock()
 		l := blobster.NewLocker(bucket,
 			blobster.WithLockClock(clock.Now),
 			blobster.WithLeaseDuration(30*time.Second),
@@ -513,7 +513,7 @@ func TestLockerNoGoroutineLeak(t *testing.T) {
 
 func TestLockerAcquireBlocksUntilReleased(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket,
 			blobster.WithLeaseDuration(time.Second),
@@ -563,9 +563,9 @@ func TestLockerAcquireBlocksUntilReleased(t *testing.T) {
 
 func TestLockerAcquireWinsTakeover(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		clock := newLockClock()
+		clock := newManualClock()
 		l := blobster.NewLocker(bucket,
 			blobster.WithLockClock(clock.Now),
 			blobster.WithLeaseDuration(30*time.Second),
@@ -623,7 +623,7 @@ func TestLockerAcquireWinsTakeover(t *testing.T) {
 
 func TestLockerAcquireRespectsContextCancel(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		l := blobster.NewLocker(bucket,
 			blobster.WithRenewInterval(time.Hour),
 			blobster.WithRetryInterval(10*time.Millisecond),
@@ -657,7 +657,7 @@ func TestLockerAcquireRespectsContextCancel(t *testing.T) {
 
 func TestLockerWithLockPrefix(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket, blobster.WithLockPrefix("custom/locks"))
 
@@ -678,7 +678,7 @@ func TestLockerWithLockPrefix(t *testing.T) {
 
 func TestLockerInvalidKeys(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket)
 
@@ -692,7 +692,7 @@ func TestLockerInvalidKeys(t *testing.T) {
 
 func TestLockerReleaseIdempotent(t *testing.T) {
 	t.Parallel()
-	eachLockBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		l := blobster.NewLocker(bucket, blobster.WithRenewInterval(time.Hour))
 

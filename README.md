@@ -28,8 +28,9 @@ Implemented:
 - lease-based distributed lock (`blobster.NewLocker`) over the conditional-write
   primitive
 - cross-region copy as an optional driver capability (`s3`, `gcs`, `azureblob`)
-- blob-backed work queue (`queue.New`) — competing consumers, at-least-once
-  delivery, approximate FIFO, built on the conditional-write primitive
+- blob-backed work queue (`blobster.NewQueue`) — competing consumers,
+  at-least-once delivery, approximate FIFO, built on the conditional-write
+  primitive
 
 Planned:
 
@@ -55,13 +56,13 @@ if err := bucket.WriteAll(ctx, "hello.txt", []byte("hello"), &blobster.WriterOpt
 
 ### Work queue
 
-The `queue` package turns any bucket that supports conditional writes into a
+`blobster.NewQueue` turns any bucket that supports conditional writes into a
 competing-consumers work queue. It owns a caller-supplied prefix and stores each
 message as an immutable payload plus a separate lease record; handlers must be
 idempotent (delivery is at-least-once).
 
 ```go
-q, err := queue.New(bucket, "jobs/", queue.WithVisibilityLease(15*time.Second))
+q, err := blobster.NewQueue(bucket, "jobs/", blobster.WithVisibilityLease(15*time.Second))
 if err != nil {
 	return err
 }

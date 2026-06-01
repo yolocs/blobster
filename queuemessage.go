@@ -1,4 +1,4 @@
-package queue
+package blobster
 
 import (
 	"context"
@@ -6,14 +6,13 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/yolocs/blobster"
 )
 
-// Message is a claimed work item. Its lease is renewed in the background until
-// Ack or Nack is called or the lease is lost. A worker that drops a Message
-// without acking or nacking leaks the background renewer and holds the message
-// until the process exits, so always settle it with Ack or Nack.
+// Message is a claimed work item from a Queue. Its lease is renewed in the
+// background until Ack or Nack is called or the lease is lost. A worker that
+// drops a Message without acking or nacking leaks the background renewer and
+// holds the message until the process exits, so always settle it with Ack or
+// Nack.
 //
 // The renewer touches only the empty-bodied lease record, never the payload, so a
 // large payload is processed without the heartbeat re-uploading it. Done and Err
@@ -48,7 +47,7 @@ func (q *Queue) startMessage(id, msgPath, leasePath, owner string, attrs map[str
 		msgPath:     msgPath,
 		leasePath:   leasePath,
 		owner:       owner,
-		attrs:       blobster.CloneMetadata(attrs),
+		attrs:       CloneMetadata(attrs),
 		receives:    receives,
 		cancelRenew: cancel,
 		stopped:     make(chan struct{}),
@@ -71,12 +70,12 @@ func (m *Message) Receives() int { return m.receives }
 
 // Attributes returns a copy of the user metadata stored with the payload at
 // enqueue.
-func (m *Message) Attributes() map[string]string { return blobster.CloneMetadata(m.attrs) }
+func (m *Message) Attributes() map[string]string { return CloneMetadata(m.attrs) }
 
 // Body opens a streaming reader over the message payload. The payload is
 // immutable, so it can be read even after the lease is lost; the caller is
 // responsible for closing the reader.
-func (m *Message) Body(ctx context.Context) (blobster.Reader, error) {
+func (m *Message) Body(ctx context.Context) (Reader, error) {
 	return m.queue.bucket.NewReader(ctx, m.msgPath, nil)
 }
 
@@ -115,23 +114,23 @@ func (m *Message) Ack(ctx context.Context) error {
 	// The renewer's final CAS may have committed a newer version even if its
 	// context was canceled mid-flight, so trust the backend rather than our cached
 	// version. Only delete a record that is still ours.
-	fields, version, err := m.queue.getRecord(ctx, m.leasePath)
-	if errors.Is(err, blobster.ErrNotFound) {
+	fields, version, err := m.queue.getLease(ctx, m.leasePath)
+	if errors.Is(err, ErrNotFound) {
 		return nil // lease already gone; nothing of ours to delete
 	}
 	if err != nil {
 		return err
 	}
-	if fields[leaseOwnerField] != m.owner {
+	if fields[queueOwnerField] != m.owner {
 		return nil // taken over by another worker
 	}
-	if err := m.queue.bucket.Delete(ctx, m.leasePath, blobster.IfMatch(version)); err != nil {
-		if errors.Is(err, blobster.ErrPreconditionFailed) || errors.Is(err, blobster.ErrNotFound) {
+	if err := m.queue.bucket.Delete(ctx, m.leasePath, IfMatch(version)); err != nil {
+		if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
 			return nil // a takeover slipped in between read and delete; leave the payload
 		}
 		return err
 	}
-	if err := m.queue.bucket.Delete(ctx, m.msgPath); err != nil && !errors.Is(err, blobster.ErrNotFound) {
+	if err := m.queue.bucket.Delete(ctx, m.msgPath); err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
 	return nil
@@ -150,29 +149,29 @@ func (m *Message) Nack(ctx context.Context) error {
 	<-m.stopped
 	m.finish(nil)
 
-	fields, version, err := m.queue.getRecord(ctx, m.leasePath)
-	if errors.Is(err, blobster.ErrNotFound) {
+	fields, version, err := m.queue.getLease(ctx, m.leasePath)
+	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if fields[leaseOwnerField] != m.owner {
+	if fields[queueOwnerField] != m.owner {
 		return nil // taken over; not ours to release
 	}
 	// Expire the lease (deadline = now) so the next claimer takes over
 	// immediately, keeping the existing receives count.
 	now := m.queue.clock()
-	opts := &blobster.WriterOptions{
+	opts := &WriterOptions{
 		Metadata: map[string]string{
-			leaseOwnerField:    m.owner,
-			leaseLeaseField:    now.Format(time.RFC3339Nano),
-			leaseReceivesField: strconv.Itoa(parseReceives(fields)),
+			queueOwnerField:    m.owner,
+			queueLeaseField:    now.Format(time.RFC3339Nano),
+			queueReceivesField: strconv.Itoa(queueParseReceives(fields)),
 		},
 		DisableContentTypeDetection: true,
 	}
-	if err := m.queue.bucket.WriteAll(ctx, m.leasePath, nil, opts, blobster.IfMatch(version)); err != nil {
-		if errors.Is(err, blobster.ErrPreconditionFailed) || errors.Is(err, blobster.ErrNotFound) {
+	if err := m.queue.bucket.WriteAll(ctx, m.leasePath, nil, opts, IfMatch(version)); err != nil {
+		if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
 			return nil
 		}
 		return err
@@ -203,7 +202,7 @@ func (m *Message) renewLoop(ctx context.Context) {
 		}
 
 		err := m.renewOnce(ctx, now)
-		if errors.Is(err, blobster.ErrPreconditionFailed) || errors.Is(err, blobster.ErrNotFound) {
+		if errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotFound) {
 			m.finish(ErrMessageLost)
 			return
 		}
@@ -217,7 +216,7 @@ func (m *Message) renewOnce(ctx context.Context, now time.Time) error {
 	version := m.version
 	m.mu.Unlock()
 
-	newVersion, err := m.queue.writeLease(ctx, m.leasePath, m.owner, now, m.receives, blobster.IfMatch(version))
+	newVersion, err := m.queue.writeLease(ctx, m.leasePath, m.owner, now, m.receives, IfMatch(version))
 	if err != nil {
 		return err
 	}

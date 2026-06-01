@@ -1,4 +1,4 @@
-package queue_test
+package blobster_test
 
 import (
 	"bytes"
@@ -14,97 +14,26 @@ import (
 	"time"
 
 	"github.com/yolocs/blobster"
-	"github.com/yolocs/blobster/file"
 	"github.com/yolocs/blobster/mem"
-	"github.com/yolocs/blobster/queue"
 )
 
-// bucketFactory builds a fresh real bucket to back a Queue. mem and file are
-// first-class drivers, not mocks, so these exercise the real conditional-write
-// code paths.
-type bucketFactory struct {
-	name string
-	make func(t *testing.T) blobster.Bucket
-}
+// This file reuses the shared test helpers defined in locker_test.go
+// (bucketFactory, eachBucket, manualClock/newManualClock, faultBucket), since the
+// queue lives in the same root package as the lock and exercises the same real
+// mem/file drivers.
 
-func queueBuckets() []bucketFactory {
-	return []bucketFactory{
-		{name: "mem", make: func(t *testing.T) blobster.Bucket { return mem.New() }},
-		{name: "file", make: func(t *testing.T) blobster.Bucket { return file.New(t.TempDir()) }},
-	}
-}
-
-func eachQueueBucket(t *testing.T, fn func(t *testing.T, bucket blobster.Bucket)) {
+func mustNewQueue(t *testing.T, bucket blobster.Bucket, prefix string, opts ...blobster.QueueOption) *blobster.Queue {
 	t.Helper()
-	for _, f := range queueBuckets() {
-		t.Run(f.name, func(t *testing.T) {
-			t.Parallel()
-			fn(t, f.make(t))
-		})
-	}
-}
-
-// testClock is a manually advanced clock for deterministic lease/expiry tests.
-type testClock struct {
-	mu sync.Mutex
-	t  time.Time
-}
-
-func newTestClock() *testClock {
-	return &testClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
-}
-
-func (c *testClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.t
-}
-
-func (c *testClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.t = c.t.Add(d)
-}
-
-// faultBucket wraps a real bucket and injects faults into WriteAll. It is fault
-// injection at the backend seam, not a storage mock: it delegates real storage to
-// the embedded bucket, so it stays within the testing standards.
-type faultBucket struct {
-	blobster.Bucket
-	mu         sync.Mutex
-	onWriteAll func(key string) error
-}
-
-func (f *faultBucket) setWriteAllHook(fn func(key string) error) {
-	f.mu.Lock()
-	f.onWriteAll = fn
-	f.mu.Unlock()
-}
-
-func (f *faultBucket) WriteAll(ctx context.Context, key string, p []byte, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
-	f.mu.Lock()
-	hook := f.onWriteAll
-	f.mu.Unlock()
-	if hook != nil {
-		if err := hook(key); err != nil {
-			return err
-		}
-	}
-	return f.Bucket.WriteAll(ctx, key, p, opts, preconditions...)
-}
-
-func mustNew(t *testing.T, bucket blobster.Bucket, prefix string, opts ...queue.Option) *queue.Queue {
-	t.Helper()
-	q, err := queue.New(bucket, prefix, opts...)
+	q, err := blobster.NewQueue(bucket, prefix, opts...)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewQueue: %v", err)
 	}
 	return q
 }
 
-func enqueueString(t *testing.T, q *queue.Queue, body string, attrs map[string]string) string {
+func enqueueString(t *testing.T, q *blobster.Queue, body string, attrs map[string]string) string {
 	t.Helper()
-	id, err := q.Enqueue(t.Context(), bytes.NewReader([]byte(body)), &queue.EnqueueOptions{Attributes: attrs})
+	id, err := q.Enqueue(t.Context(), bytes.NewReader([]byte(body)), &blobster.EnqueueOptions{Attributes: attrs})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -113,9 +42,9 @@ func enqueueString(t *testing.T, q *queue.Queue, body string, attrs map[string]s
 
 func TestQueueEnqueueReceiveAck(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		q := mustNew(t, bucket, "jobs/")
+		q := mustNewQueue(t, bucket, "jobs/")
 
 		id := enqueueString(t, q, "hello", map[string]string{"kind": "greeting"})
 
@@ -151,7 +80,7 @@ func TestQueueEnqueueReceiveAck(t *testing.T) {
 		if ok, _ := bucket.Exists(ctx, "jobs/msg/"+id); ok {
 			t.Error("payload still exists after ack")
 		}
-		if _, err := q.TryReceive(ctx); !errors.Is(err, queue.ErrNoMessages) {
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
 			t.Fatalf("TryReceive on empty: got %v, want ErrNoMessages", err)
 		}
 	})
@@ -159,9 +88,9 @@ func TestQueueEnqueueReceiveAck(t *testing.T) {
 
 func TestQueueTryReceiveEmpty(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
-		q := mustNew(t, bucket, "jobs/")
-		if _, err := q.TryReceive(t.Context()); !errors.Is(err, queue.ErrNoMessages) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		q := mustNewQueue(t, bucket, "jobs/")
+		if _, err := q.TryReceive(t.Context()); !errors.Is(err, blobster.ErrNoMessages) {
 			t.Fatalf("got %v, want ErrNoMessages", err)
 		}
 	})
@@ -170,21 +99,21 @@ func TestQueueTryReceiveEmpty(t *testing.T) {
 func TestQueueInvalidPrefix(t *testing.T) {
 	t.Parallel()
 	for _, prefix := range []string{"", "/abs/", "a/../b/"} {
-		if _, err := queue.New(mem.New(), prefix); !errors.Is(err, queue.ErrInvalidQueuePrefix) {
-			t.Errorf("New(%q): got %v, want ErrInvalidQueuePrefix", prefix, err)
+		if _, err := blobster.NewQueue(mem.New(), prefix); !errors.Is(err, blobster.ErrInvalidQueuePrefix) {
+			t.Errorf("NewQueue(%q): got %v, want ErrInvalidQueuePrefix", prefix, err)
 		}
 	}
 	// A prefix without a trailing slash is normalized, not rejected.
-	if _, err := queue.New(mem.New(), "jobs"); err != nil {
-		t.Errorf("New(\"jobs\"): unexpected error %v", err)
+	if _, err := blobster.NewQueue(mem.New(), "jobs"); err != nil {
+		t.Errorf("NewQueue(\"jobs\"): unexpected error %v", err)
 	}
 }
 
 func TestQueueConcurrentReceiveSingleWinner(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		q := mustNew(t, bucket, "jobs/")
+		q := mustNewQueue(t, bucket, "jobs/")
 		enqueueString(t, q, "only-one", nil)
 
 		const contenders = 16
@@ -194,7 +123,7 @@ func TestQueueConcurrentReceiveSingleWinner(t *testing.T) {
 			empty   atomic.Int64
 			start   = make(chan struct{})
 		)
-		var winner atomic.Pointer[queue.Message]
+		var winner atomic.Pointer[blobster.Message]
 		for range contenders {
 			wg.Add(1)
 			go func() {
@@ -205,7 +134,7 @@ func TestQueueConcurrentReceiveSingleWinner(t *testing.T) {
 				case err == nil:
 					winners.Add(1)
 					winner.Store(msg)
-				case errors.Is(err, queue.ErrNoMessages):
+				case errors.Is(err, blobster.ErrNoMessages):
 					empty.Add(1)
 				default:
 					t.Errorf("unexpected error: %v", err)
@@ -231,15 +160,15 @@ func TestQueueConcurrentReceiveSingleWinner(t *testing.T) {
 
 func TestQueueTakeoverIncrementsReceives(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		clock := newTestClock()
+		clock := newManualClock()
 		// Renew far in the future so a holder never self-renews; expiry is driven
 		// purely by the clock.
-		q := mustNew(t, bucket, "jobs/",
-			queue.WithClock(clock.Now),
-			queue.WithVisibilityLease(30*time.Second),
-			queue.WithRenewInterval(time.Hour),
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(time.Hour),
 		)
 		enqueueString(t, q, "work", nil)
 
@@ -252,7 +181,7 @@ func TestQueueTakeoverIncrementsReceives(t *testing.T) {
 		}
 
 		// Within the lease: not redeliverable.
-		if _, err := q.TryReceive(ctx); !errors.Is(err, queue.ErrNoMessages) {
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
 			t.Fatalf("receive before expiry: got %v, want ErrNoMessages", err)
 		}
 
@@ -285,9 +214,9 @@ func TestQueueTakeoverIncrementsReceives(t *testing.T) {
 
 func TestQueueNackRedeliversPreservingReceives(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		q := mustNew(t, bucket, "jobs/", queue.WithRenewInterval(time.Hour))
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
 		id := enqueueString(t, q, "retry-me", nil)
 
 		first, err := q.TryReceive(ctx)
@@ -318,13 +247,13 @@ func TestQueueNackRedeliversPreservingReceives(t *testing.T) {
 
 func TestQueueAckAfterTakeoverIsNoOp(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		clock := newTestClock()
-		q := mustNew(t, bucket, "jobs/",
-			queue.WithClock(clock.Now),
-			queue.WithVisibilityLease(30*time.Second),
-			queue.WithRenewInterval(time.Hour),
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(time.Hour),
 		)
 		id := enqueueString(t, q, "work", nil)
 
@@ -366,15 +295,15 @@ func TestQueueAckAfterTakeoverIsNoOp(t *testing.T) {
 
 func TestQueueLostNotification(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		// Freeze the clock so the only way to lose the message is the renew CAS
 		// failing because the lease record changed under us.
-		clock := newTestClock()
-		q := mustNew(t, bucket, "jobs/",
-			queue.WithClock(clock.Now),
-			queue.WithVisibilityLease(30*time.Second),
-			queue.WithRenewInterval(10*time.Millisecond),
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(10*time.Millisecond),
 		)
 		id := enqueueString(t, q, "work", nil)
 
@@ -391,7 +320,7 @@ func TestQueueLostNotification(t *testing.T) {
 
 		select {
 		case <-msg.Done():
-			if !errors.Is(msg.Err(), queue.ErrMessageLost) {
+			if !errors.Is(msg.Err(), blobster.ErrMessageLost) {
 				t.Fatalf("Err() = %v, want ErrMessageLost", msg.Err())
 			}
 		case <-time.After(2 * time.Second):
@@ -402,16 +331,16 @@ func TestQueueLostNotification(t *testing.T) {
 
 func TestQueueRenewKeepsMessageHeld(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		// Freeze the clock so the lease can never lapse from wall-clock timing;
 		// prove renewal by observing the lease record's version advance while the
 		// message stays held and unlost.
-		clock := newTestClock()
-		q := mustNew(t, bucket, "jobs/",
-			queue.WithClock(clock.Now),
-			queue.WithVisibilityLease(30*time.Second),
-			queue.WithRenewInterval(20*time.Millisecond),
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(20*time.Millisecond),
 		)
 		id := enqueueString(t, q, "work", nil)
 
@@ -450,12 +379,12 @@ func TestQueueRenewKeepsMessageHeld(t *testing.T) {
 
 func TestQueueRenewSurvivesTransientError(t *testing.T) {
 	t.Parallel()
-	clock := newTestClock()
+	clock := newManualClock()
 	fb := &faultBucket{Bucket: mem.New()}
-	q := mustNew(t, fb, "jobs/",
-		queue.WithClock(clock.Now),
-		queue.WithVisibilityLease(30*time.Second),
-		queue.WithRenewInterval(10*time.Millisecond),
+	q := mustNewQueue(t, fb, "jobs/",
+		blobster.WithQueueClock(clock.Now),
+		blobster.WithVisibilityLease(30*time.Second),
+		blobster.WithQueueRenewInterval(10*time.Millisecond),
 	)
 	ctx := t.Context()
 	id := enqueueString(t, q, "work", nil)
@@ -501,11 +430,11 @@ func TestQueueRenewSurvivesTransientError(t *testing.T) {
 
 func TestQueueReceiveBlocksUntilEnqueued(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		q := mustNew(t, bucket, "jobs/", queue.WithReceiveBackoff(10*time.Millisecond, 20*time.Millisecond))
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithReceiveBackoff(10*time.Millisecond, 20*time.Millisecond))
 
-		received := make(chan *queue.Message, 1)
+		received := make(chan *blobster.Message, 1)
 		go func() {
 			msg, err := q.Receive(ctx)
 			if err != nil {
@@ -540,8 +469,8 @@ func TestQueueReceiveBlocksUntilEnqueued(t *testing.T) {
 
 func TestQueueReceiveRespectsContextCancel(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
-		q := mustNew(t, bucket, "jobs/", queue.WithReceiveBackoff(5*time.Millisecond, 10*time.Millisecond))
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithReceiveBackoff(5*time.Millisecond, 10*time.Millisecond))
 
 		t.Run("deadline", func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -565,16 +494,16 @@ func TestQueueReceiveRespectsContextCancel(t *testing.T) {
 
 func TestQueueCompetingConsumersDrainAll(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
 		// Lease long and renew long so nothing is redelivered by lease expiry; any
 		// duplicate delivery here would be the inherent at-least-once window of the
 		// non-atomic two-delete ack, which the test tolerates. Every message must
 		// be delivered at least once and the queue must fully drain.
-		q := mustNew(t, bucket, "jobs/",
-			queue.WithVisibilityLease(time.Minute),
-			queue.WithRenewInterval(time.Hour),
-			queue.WithHeadWindow(512),
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithVisibilityLease(time.Minute),
+			blobster.WithQueueRenewInterval(time.Hour),
+			blobster.WithHeadWindow(512),
 		)
 
 		const messages = 60
@@ -604,7 +533,7 @@ func TestQueueCompetingConsumersDrainAll(t *testing.T) {
 					default:
 					}
 					msg, err := q.TryReceive(ctx)
-					if errors.Is(err, queue.ErrNoMessages) {
+					if errors.Is(err, blobster.ErrNoMessages) {
 						select {
 						case <-done:
 							return
@@ -646,7 +575,7 @@ func TestQueueCompetingConsumersDrainAll(t *testing.T) {
 			}
 		}
 		// Nothing should remain leased or stored once every message is acked.
-		if _, err := q.TryReceive(ctx); !errors.Is(err, queue.ErrNoMessages) {
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
 			t.Fatalf("queue not drained: %v", err)
 		}
 	})
@@ -654,9 +583,9 @@ func TestQueueCompetingConsumersDrainAll(t *testing.T) {
 
 func TestQueueLargeStreamedPayload(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		q := mustNew(t, bucket, "jobs/")
+		q := mustNewQueue(t, bucket, "jobs/")
 
 		// A multi-megabyte payload exercises the streamed write/read path; the
 		// renewer never touches the payload, only the tiny lease record.
@@ -696,9 +625,9 @@ func TestQueueLargeStreamedPayload(t *testing.T) {
 
 func TestQueueAckNackIdempotent(t *testing.T) {
 	t.Parallel()
-	eachQueueBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		q := mustNew(t, bucket, "jobs/", queue.WithRenewInterval(time.Hour))
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
 		enqueueString(t, q, "work", nil)
 
 		msg, err := q.TryReceive(ctx)
@@ -716,7 +645,7 @@ func TestQueueAckNackIdempotent(t *testing.T) {
 		if err := msg.Nack(ctx); err != nil {
 			t.Fatalf("nack after ack: %v", err)
 		}
-		if _, err := q.TryReceive(ctx); !errors.Is(err, queue.ErrNoMessages) {
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
 			t.Fatalf("queue not empty after ack: %v", err)
 		}
 		select {
@@ -735,7 +664,7 @@ func TestQueueNoGoroutineLeak(t *testing.T) {
 	// tests until the serial ones complete, so none run concurrently here — the
 	// documented process-global exception to the t.Parallel rule.
 	ctx := t.Context()
-	q := mustNew(t, mem.New(), "jobs/", queue.WithRenewInterval(5*time.Millisecond))
+	q := mustNewQueue(t, mem.New(), "jobs/", blobster.WithQueueRenewInterval(5*time.Millisecond))
 	enqueueString(t, q, "work", nil)
 
 	base := runtime.NumGoroutine()
@@ -758,10 +687,10 @@ func TestQueueNoGoroutineLeak(t *testing.T) {
 	}
 }
 
-func TestNewIDSortableAndFixedWidth(t *testing.T) {
+func TestQueueNewIDSortableAndFixedWidth(t *testing.T) {
 	t.Parallel()
-	clock := newTestClock()
-	q := mustNew(t, mem.New(), "jobs/", queue.WithClock(clock.Now))
+	clock := newManualClock()
+	q := mustNewQueue(t, mem.New(), "jobs/", blobster.WithQueueClock(clock.Now))
 	ctx := t.Context()
 
 	var ids []string

@@ -1,4 +1,4 @@
-package queue
+package blobster
 
 import (
 	crand "crypto/rand"
@@ -10,25 +10,25 @@ import (
 // identically to the underlying 128-bit value.
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-// idLen is the fixed width of an encoded id: 48-bit timestamp in 10 chars plus
-// 80-bit randomness in 16 chars.
-const idLen = 26
+// queueIDLen is the fixed width of an encoded queue message id: a 48-bit
+// millisecond timestamp in 10 chars plus 80-bit randomness in 16 chars.
+const queueIDLen = 26
 
-// newID returns a ULID-style identifier: a 48-bit millisecond timestamp followed
-// by 80 bits of randomness, Crockford-base32 encoded into a fixed-width, lexically
-// sortable, 26-character string. Lexical order tracks creation time (to the
-// millisecond), which is what gives the queue its approximate-FIFO discovery
-// order; the randomness keeps ids unique within a millisecond and free of any
-// hot shared counter. The clock is injected so tests can drive ordering
+// newQueueID returns a ULID-style identifier: a 48-bit millisecond timestamp
+// followed by 80 bits of randomness, Crockford-base32 encoded into a fixed-width,
+// lexically sortable, 26-character string. Lexical order tracks creation time (to
+// the millisecond), which is what gives the queue its approximate-FIFO discovery
+// order; the randomness keeps ids unique within a millisecond and free of any hot
+// shared counter. The clock is injected so tests can drive ordering
 // deterministically.
-func newID(now time.Time) (string, error) {
+func newQueueID(now time.Time) (string, error) {
 	var ent [10]byte
 	if _, err := crand.Read(ent[:]); err != nil {
 		return "", err
 	}
 	ms := uint64(now.UnixMilli())
 
-	var b [idLen]byte
+	var b [queueIDLen]byte
 	// 48-bit timestamp → 10 chars (top 2 bits of the first char are always 0,
 	// since 48 bits span only 9.6 chars).
 	b[0] = crockford[(ms>>45)&0x1f]

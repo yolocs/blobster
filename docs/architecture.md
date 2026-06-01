@@ -577,12 +577,14 @@ pending copy per destination.
 
 ## Blob-backed work queue
 
-The `queue` package is a **work queue built solely on blob storage** —
-competing consumers, at-least-once delivery, approximate FIFO — and is the next
-coordination primitive after the lock. Like `multipart`, it lives in its own
-folder and depends only on the root interfaces (never on a concrete driver), and
-like the lock it builds entirely on the conditional-write primitive. A `Queue`
-is constructed with `queue.New(bucket, prefix, …)` over any bucket that
+The work queue is a **utility built solely on blob storage** — competing
+consumers, at-least-once delivery, approximate FIFO — and is the next
+coordination primitive after the lock. Like the lock, it **lives in the root
+`blobster` package** (not its own folder): it depends only on the root contract
+and the conditional-write primitive, has no cloud-specific logic, and is a core
+coordination primitive, so surfacing it at the top level keeps the dependency
+graph one-directional — the same reasoning that keeps the lock in root. A `Queue`
+is constructed with `blobster.NewQueue(bucket, prefix, …)` over any bucket that
 advertises `ConditionalWrites`.
 
 **Two objects per message — "the lock, applied per message."** Each message is a
@@ -644,8 +646,11 @@ digraph queue {
 The per-message lease is the lock's algorithm with a richer record (it adds
 `receives`) and a non-deleting "expire on nack." The public `Locker` exposes
 neither, so the queue implements its own claim/takeover/renew/expire/
-conditional-delete in `queue/` that mirrors `locker.go`, rather than depend on
-`Locker`. This keeps the shipped lock untouched and the queue self-contained, at
+conditional-delete (in `queue.go`/`queuemessage.go`) that mirrors `locker.go`,
+rather than depend on `Locker`. Both sit side by side in the root package — the
+queue's lease helpers are unexported and prefixed (`queueLeaseExpired`,
+`queueParseReceives`, …) so they coexist with the lock's without collision. This
+keeps the shipped lock untouched and the queue self-contained, at
 the cost of paralleling the renewer logic. If a third lease user appears, the
 shared engine gets extracted then — generalizing `Locker` now was rejected for
 the same reason the storage design avoids touching shipped code.
@@ -698,19 +703,19 @@ possible.
 
 The repository stays flat: the user-facing interfaces and shared types live in
 the root `blobster` package; everything with substantial implementation gets its
-own folder; docs live under `docs/`. The lock is the one deliberate exception —
-it depends only on the root contract and is a core primitive, so it lives in the
-root package rather than its own folder.
+own folder; docs live under `docs/`. The lock and the work queue are the
+deliberate exceptions — both depend only on the root contract, carry no
+cloud-specific logic, and are core coordination primitives, so they live in the
+root package rather than their own folders.
 
 ```
 blobster/            ← root package: Bucket + optional capability interfaces,
                        Attributes, Precondition/conditions, errors, Capabilities,
-                       the lease lock (Locker, Lock, NewLocker over a Bucket), and
-                       the cross-region copy handle (CopyOperation,
+                       the lease lock (Locker, Lock, NewLocker over a Bucket), the
+                       blob-backed work queue (Queue, Message, NewQueue over a
+                       Bucket), and the cross-region copy handle (CopyOperation,
                        StartCopyOperation) backing the CrossRegionCopier capability
 multipart/           ← parallel-upload helper over MultipartUploader
-queue/               ← blob-backed work queue (enqueue/lease/ack) over the
-                       conditional-write primitive; depends on root interfaces only
 mem/                 ← in-memory driver (reference implementation + test substrate)
 file/                ← filesystem driver (local integration + small deployments)
 s3/                  ← AWS S3 driver (wraps a caller-owned *s3.Client)
@@ -728,22 +733,22 @@ README.md  LICENSE  go.mod  Makefile
 ### Dependency rule
 
 ```
-                 multipart/   queue/        (utilities: depend on root interfaces only)
-                         │     │
-                         ▼     ▼
-        blobster (root: interfaces + types + lease lock + cross-region copy handle)
+                     multipart/             (utility: depends on root interfaces only)
+                         │
+                         ▼
+   blobster (root: interfaces + types + lease lock + work queue + cross-region copy handle)
                          ▲
                          │
    mem/ file/ s3/ gcs/ azureblob/  (drivers: implement root interfaces; import only root)
 ```
 
 - Drivers import **only** the root `blobster` package (and their native SDK).
-- The lease lock lives in the root package; it depends only on the root
-  contract (no driver imports), so surfacing it at the top level keeps the
-  dependency graph one-directional.
-- The `multipart` and `queue` utility packages depend on the root **interfaces**,
-  never on a concrete driver — so they work against any backend that advertises
-  the needed capability. Cross-region copy is not a utility package: its capability
+- The lease lock and the work queue live in the root package; each depends only
+  on the root contract (no driver imports), so surfacing them at the top level
+  keeps the dependency graph one-directional.
+- The `multipart` utility package depends on the root **interfaces**, never on a
+  concrete driver — so it works against any backend that advertises the needed
+  capability. Cross-region copy is not a utility package: its capability
   (`CrossRegionCopier`) is implemented directly on each cloud driver and its
   handle (`CopyOperation`) lives in root, mirroring the lock.
 - No driver imports another driver. The arrows point one way.
@@ -780,9 +785,10 @@ errors onto these so callers write backend-agnostic error handling. The lock
 adds `ErrLockHeld` (a live holder owns it), `ErrLockLost` (lease could not be
 renewed), and `ErrInvalidLockKey`; internally it reuses `ErrNotFound` and
 `ErrPreconditionFailed` to interpret the bucket's conditional ops rather than
-introducing parallel sentinels. The `queue` package follows the same convention:
-it reuses `ErrNotFound`/`ErrPreconditionFailed` internally and adds
-`ErrNoMessages`, `ErrMessageLost`, and `ErrInvalidQueuePrefix`.
+introducing parallel sentinels. The work queue (also in the root package)
+follows the same convention: it reuses `ErrNotFound`/`ErrPreconditionFailed`
+internally and adds `ErrNoMessages`, `ErrMessageLost`, and
+`ErrInvalidQueuePrefix`.
 
 ## Non-goals / deferred
 

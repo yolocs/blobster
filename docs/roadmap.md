@@ -89,9 +89,10 @@ pin the interface and are the test substrate everything else relies on.
 
 ### Blob-backed work queue
 - Work queue over the conditional-write primitive: competing consumers,
-  at-least-once delivery, approximate FIFO. **Built and shipped** in the `queue`
-  package (`queue.New(bucket, prefix, …)`), depending only on the root
-  interfaces like `multipart`. Two objects per message — an immutable streamed
+  at-least-once delivery, approximate FIFO. **Built and shipped** in the root
+  package (`blobster.NewQueue(bucket, prefix, …)`), alongside the lock — it
+  depends only on the root contract and carries no cloud-specific logic. Two
+  objects per message — an immutable streamed
   payload and a separate empty-bodied lease record managed exactly like the
   lock's lease — so the heartbeat never re-uploads the payload. Enqueue / Receive
   (poll with backoff) / TryReceive / Ack / Nack, ULID-style sortable ids, and a
