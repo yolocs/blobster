@@ -9,8 +9,9 @@ GitHub issues.
 
 This describes both the implemented foundation and the **target** architecture.
 The base `Bucket` API, shared conformance tests, and the `mem`, `file`, `gcs`,
-`s3`, and `azureblob` drivers are implemented, as are the lease lock and S3
-cross-region copy. The remaining higher-level utilities are planned. The
+`s3`, and `azureblob` drivers are implemented, as are the lease lock, cross-region
+copy, and the blob-backed work queue. The remaining higher-level utilities
+(multipart) are planned. The
 **backend API facts** the design depends on —
 conditional writes, cross-region copy, multipart — are verified against the
 providers' docs and Go SDKs; the evidence and exact API surfaces live in
@@ -27,7 +28,8 @@ reach for a second system to get:
 - **parallel multipart upload** for large objects,
 - a **distributed lock** for mutual exclusion across processes and hosts,
 - **cross-region copy** using each cloud's native copy machinery,
-- (exploratory) a **queue** and other coordination primitives.
+- a **blob-backed work queue** (competing consumers, at-least-once, approximate
+  FIFO), and other coordination primitives.
 
 The thesis: a service that already operates an object store should not need a
 lock service, a queue broker, or a metadata database to get these primitives.
@@ -573,6 +575,125 @@ objects) via the global endpoint; and Azure requires a **read SAS on a
 cross-account source** — which must never be logged — and permits only one
 pending copy per destination.
 
+## Blob-backed work queue
+
+The `queue` package is a **work queue built solely on blob storage** —
+competing consumers, at-least-once delivery, approximate FIFO — and is the next
+coordination primitive after the lock. Like `multipart`, it lives in its own
+folder and depends only on the root interfaces (never on a concrete driver), and
+like the lock it builds entirely on the conditional-write primitive. A `Queue`
+is constructed with `queue.New(bucket, prefix, …)` over any bucket that
+advertises `ConditionalWrites`.
+
+**Two objects per message — "the lock, applied per message."** Each message is a
+pair of objects under a caller-supplied prefix the queue owns wholesale:
+
+```
+<prefix>/msg/<id>     payload: written once at enqueue, immutable, streamed (any
+                      size); user attributes live in its metadata
+<prefix>/lease/<id>   lease record: empty body, metadata {owner, lease
+                      (RFC3339Nano deadline), receives}; the per-message "lock"
+```
+
+Splitting the immutable payload from the mutating lease is the load-bearing
+decision. `WriteAll` is whole-object, so a single object holding both would force
+every heartbeat to re-buffer and re-upload the payload. With them split, the
+heartbeat rewrites only the tiny, empty-bodied lease record — so payloads stream
+at any size with no buffering (honoring "stream, don't buffer"), and the renew
+path is **exactly the lock's**. Because user attributes live on the payload
+object and lease state on the separate lease object, there is no
+reserved-metadata clash between them. This needs **no new interface primitive and
+touches no shipped behavior**.
+
+```dot
+digraph queue {
+  rankdir=LR;
+  avail [label="available\n(payload exists,\nno live lease)"];
+  held  [label="leased\n(owner, lease, receives)"];
+  gone  [label="acked\n(both deleted)"];
+  avail -> held [label="Receive:\nclaim lease (create if absent,\nor CAS-takeover if expired), receives++"];
+  held  -> held [label="renew:\nCAS extend lease\n(payload untouched)"];
+  held  -> gone [label="Ack:\nDelete lease (CAS) then payload"];
+  held  -> avail [label="Nack / lease expiry:\nexpire lease in place\n(receives preserved)"];
+}
+```
+
+- **Enqueue** writes the payload create-only (`IfNotExists`) and streams it; no
+  lease record exists yet. *Available* = payload present with no live lease.
+- **Receive/TryReceive** lists a head window of `<prefix>/msg/`, picks a
+  candidate, and acquires its lease — this is the lock's `tryAcquire` plus a
+  `receives` field: create-if-absent (`receives=1`), CAS-takeover of an expired
+  lease (`receives++`), or skip a live one. `Receive` blocks with exponential
+  jittered backoff while empty; `TryReceive` returns `ErrNoMessages`. This
+  mirrors `Acquire`/`TryAcquire`. A held `Message` runs the lock's background
+  renewer on an internal context and surfaces a lost lease via `Done()`/`Err()`.
+- **Ack** stops the renewer, then deletes the **lease first** (CAS, only if still
+  ours) and the **payload second**. Lease-first ordering means a crash between the
+  two deletes costs at most one extra, idempotent redelivery and **never** leaves
+  an orphaned lease that discovery would not revisit (payload-first would orphan
+  the lease). The same non-atomic window means even an uncrashed concurrent
+  consumer can occasionally redeliver — at-least-once is the contract, not an
+  edge case.
+- **Nack** expires the lease in place (deadline = now), **preserving** `receives`
+  (never resetting it, so a poison message cannot loop forever at count 1); the
+  message is immediately reclaimable.
+- **Redelivery** is identical to lock takeover: a crashed worker stops renewing,
+  its lease deadline passes, and the next claimer CAS-takes-over with `receives++`.
+
+**The lease engine is a focused parallel of the lock, not a dependency on it.**
+The per-message lease is the lock's algorithm with a richer record (it adds
+`receives`) and a non-deleting "expire on nack." The public `Locker` exposes
+neither, so the queue implements its own claim/takeover/renew/expire/
+conditional-delete in `queue/` that mirrors `locker.go`, rather than depend on
+`Locker`. This keeps the shipped lock untouched and the queue self-contained, at
+the cost of paralleling the renewer logic. If a third lease user appears, the
+shared engine gets extracted then — generalizing `Locker` now was rejected for
+the same reason the storage design avoids touching shipped code.
+
+**Discovery and contention.** `Receive` lists the first `HeadWindow` keys under
+`<prefix>/msg/` (lexically sorted ≈ oldest-first, since ids are time-sortable),
+then iterates from a jittered offset within a small front window so workers
+prefer the earliest message without all stampeding the single first one.
+Leased-but-unacked payloads stay listed until acked, so the window must be sized
+above the worker count or they crowd out available messages. Claim-race losers
+(`ErrPreconditionFailed`) fall through to the next candidate; an empty pass backs
+off exponentially with jitter up to a cap.
+
+**Ids are ULID-style.** A 48-bit millisecond timestamp plus 80 bits of
+randomness, Crockford-base32 encoded to a fixed-width, lexically sortable
+26-character string. Lexical order tracks creation time (giving the
+approximate-FIFO listing order) with no hot shared counter; the randomness keeps
+ids unique within a millisecond. The clock is injectable for deterministic tests.
+
+**The prefix is required and owned wholesale.** Unlike the lock and multipart —
+whose bookkeeping lives under the reserved `.blobster/` subtree so it never
+collides with caller keys — the queue's prefix is a **caller-supplied required
+argument with no default**, and the queue owns everything beneath it (`msg/` and
+`lease/`). There is nothing to collide with because the caller dedicates the
+prefix to the queue. **Sharding is the caller's composition**: run N queues over
+N prefixes to spread load past a single prefix's request-rate ceiling. `New`
+returns `ErrInvalidQueuePrefix` for an empty or subtree-escaping prefix (the one
+construction error; the lock validates its key per-acquire instead, but the
+queue's prefix is fixed at construction, so it is validated there).
+
+**Errors.** The queue reuses `ErrNotFound`/`ErrPreconditionFailed` internally to
+interpret conditional ops (like the lock) and adds three of its own:
+`ErrNoMessages` (`TryReceive` on an empty queue), `ErrMessageLost` (the held
+lease was lost), and `ErrInvalidQueuePrefix`.
+
+**Documented limitations.** Single-prefix request-rate ceiling (shard via
+multiple queues); idle polling cost (there is no push/long-poll on blob storage);
+approximate-only ordering (concurrency, clock skew, and redelivery break strict
+FIFO); at-least-once with **mandatory handler idempotency**; auto-renew means a
+wedged-but-alive worker holds its one message until process death (head-of-line
+on that message only, not a queue stall); and two objects per message with a
+non-atomic two-delete ack (a crash — or a concurrent claim — in the mid-ack
+window costs one idempotent redelivery, never an orphan). **Dead-letter /
+max-receives is deliberately out of scope here** (tracked separately); the
+`receives` count is surfaced on every `Message` so a caller can implement a
+poison-message policy today, and the never-reset count is what makes that
+possible.
+
 ## Code layout
 
 The repository stays flat: the user-facing interfaces and shared types live in
@@ -588,6 +709,8 @@ blobster/            ← root package: Bucket + optional capability interfaces,
                        the cross-region copy handle (CopyOperation,
                        StartCopyOperation) backing the CrossRegionCopier capability
 multipart/           ← parallel-upload helper over MultipartUploader
+queue/               ← blob-backed work queue (enqueue/lease/ack) over the
+                       conditional-write primitive; depends on root interfaces only
 mem/                 ← in-memory driver (reference implementation + test substrate)
 file/                ← filesystem driver (local integration + small deployments)
 s3/                  ← AWS S3 driver (wraps a caller-owned *s3.Client)
@@ -605,9 +728,9 @@ README.md  LICENSE  go.mod  Makefile
 ### Dependency rule
 
 ```
-                     multipart/             (utility: depends on root interfaces only)
-                         │
-                         ▼
+                 multipart/   queue/        (utilities: depend on root interfaces only)
+                         │     │
+                         ▼     ▼
         blobster (root: interfaces + types + lease lock + cross-region copy handle)
                          ▲
                          │
@@ -618,9 +741,9 @@ README.md  LICENSE  go.mod  Makefile
 - The lease lock lives in the root package; it depends only on the root
   contract (no driver imports), so surfacing it at the top level keeps the
   dependency graph one-directional.
-- The `multipart` utility package depends on the root **interfaces**, never on a
-  concrete driver — so it works against any backend that advertises the needed
-  capability. Cross-region copy is not a utility package: its capability
+- The `multipart` and `queue` utility packages depend on the root **interfaces**,
+  never on a concrete driver — so they work against any backend that advertises
+  the needed capability. Cross-region copy is not a utility package: its capability
   (`CrossRegionCopier`) is implemented directly on each cloud driver and its
   handle (`CopyOperation`) lives in root, mirroring the lock.
 - No driver imports another driver. The arrows point one way.
@@ -641,6 +764,13 @@ Listing the bucket's caller-visible contents excludes the `.blobster/` subtree.
 `Sub(prefix)` composes prefixes, and each re-rooted bucket gets its own
 `.blobster/` namespace beneath its root.
 
+The **work queue is the deliberate exception**: its prefix is a caller-supplied
+required argument, not a reserved subtree, and the queue owns everything beneath
+it (`<prefix>/msg/` and `<prefix>/lease/`). The caller dedicates that prefix to
+the queue, so there is nothing to collide with and no need to hide it under
+`.blobster/`. (It is built on `Sub(prefix)`, so the same prefix-composition
+applies.)
+
 ## Errors
 
 Sentinel errors live in the root package and are `errors.Is`-matchable:
@@ -650,7 +780,9 @@ errors onto these so callers write backend-agnostic error handling. The lock
 adds `ErrLockHeld` (a live holder owns it), `ErrLockLost` (lease could not be
 renewed), and `ErrInvalidLockKey`; internally it reuses `ErrNotFound` and
 `ErrPreconditionFailed` to interpret the bucket's conditional ops rather than
-introducing parallel sentinels.
+introducing parallel sentinels. The `queue` package follows the same convention:
+it reuses `ErrNotFound`/`ErrPreconditionFailed` internally and adds
+`ErrNoMessages`, `ErrMessageLost`, and `ErrInvalidQueuePrefix`.
 
 ## Non-goals / deferred
 
@@ -661,7 +793,10 @@ introducing parallel sentinels.
 - **A POSIX filesystem.** No partial in-place edits, no rename-as-move
   semantics beyond what `Copy` + `Delete` express.
 - **Resumable multipart** (persisting an upload id across processes) — backlog.
-- **The queue and other coordination primitives** — exploratory; see
+- **Dead-letter / max-receives for the queue** — out of scope for the queue's
+  first cut and tracked separately; the never-reset `receives` count is surfaced
+  on every `Message` so a caller can build a poison-message policy meanwhile.
+- **Other coordination primitives beyond the lock and queue** — exploratory; see
   `roadmap.md`.
 - **Ambient configuration / driver auto-registration** — intentionally absent;
   see invariant 2.
