@@ -1,0 +1,38 @@
+name: Sync Labels
+
+# Ensures the release-note category labels exist in the repo so PRs (including
+# ones opened by agents) can always be labeled. Labels are declared here as the
+# single source of truth; `gh label create --force` creates or updates each one.
+# Run automatically when this file changes on main, or manually via the Actions
+# tab. No third-party actions — just the gh CLI preinstalled on the runner.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/sync-labels.yml
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    name: Ensure release-note labels exist
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Apply labels
+        run: |
+          set -euo pipefail
+          ensure() { gh label create "$1" --color "$2" --description "$3" --force; }
+          ensure breaking           b60205 "Backwards-incompatible API change"
+          ensure feature            0e8a16 "New feature"
+          ensure enhancement        a2eeef "New feature or request"
+          ensure fix                fbca04 "Bug fix"
+          ensure bug                d73a4a "Something isn't working"
+          ensure docs               0075ca "Documentation"
+          ensure documentation      0075ca "Improvements or additions to documentation"
+          ensure ignore-for-release ededed "Excluded from release notes"
