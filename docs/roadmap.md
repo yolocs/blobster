@@ -95,7 +95,8 @@ pin the interface and are the test substrate everything else relies on.
   objects per message — an immutable streamed
   payload and a separate empty-bodied lease record managed exactly like the
   lock's lease — so the heartbeat never re-uploads the payload. Enqueue / Receive
-  (poll with backoff) / TryReceive / Ack / Nack, ULID-style sortable ids, and a
+  (poll with backoff) / TryReceive / Ack / Nack, time-sortable ids (padded
+  millisecond timestamp + UUID), and a
   never-reset `receives` count surfaced on each message. Handlers must be
   idempotent (the lock's liveness-not-safety contract, per message).
   - **Follow-up — dead-letter / max-receives:** route a message aside once

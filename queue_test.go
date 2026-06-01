@@ -702,13 +702,18 @@ func TestQueueNewIDSortableAndFixedWidth(t *testing.T) {
 	ctx := t.Context()
 
 	var ids []string
+	width := -1
 	for range 50 {
 		id, err := q.Enqueue(ctx, bytes.NewReader(nil), nil)
 		if err != nil {
 			t.Fatalf("Enqueue: %v", err)
 		}
-		if len(id) != 26 {
-			t.Fatalf("id %q has length %d, want 26", id, len(id))
+		// Fixed width is what makes lexical order equal chronological order; assert
+		// every id is the same length rather than hardcoding the exact value.
+		if width == -1 {
+			width = len(id)
+		} else if len(id) != width {
+			t.Fatalf("id %q has length %d, want fixed width %d", id, len(id), width)
 		}
 		ids = append(ids, id)
 		clock.Advance(time.Millisecond)

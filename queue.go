@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Queue sentinel errors, matchable with errors.Is.
@@ -77,9 +79,9 @@ const queueJitterWindow = 16
 // The model is at-least-once: a worker that crashes mid-processing has its lease
 // expire and the message redelivered, so handlers must be idempotent — the same
 // liveness-not-safety contract the lock documents. Ordering is approximate: ids
-// are ULID-style (millisecond time plus randomness, lexically sortable), and
-// workers prefer the lexically-earliest available message, but concurrency, clock
-// skew, and redelivery make it best-effort only.
+// are a zero-padded millisecond timestamp plus a random UUID (lexically sortable
+// by time), and workers prefer the lexically-earliest available message, but
+// concurrency, clock skew, and redelivery make it best-effort only.
 //
 // A Queue is safe for concurrent use; construct one per prefix with NewQueue and
 // share it across workers. The bucket must advertise ConditionalWrites.
@@ -208,22 +210,11 @@ func (q *Queue) Enqueue(ctx context.Context, r io.Reader, opts *EnqueueOptions) 
 	if opts != nil {
 		attrs = opts.Attributes
 	}
-	// Retry on the astronomically unlikely id collision rather than surfacing it.
-	for attempt := 0; attempt < 3; attempt++ {
-		id, err := newQueueID(q.clock())
-		if err != nil {
-			return "", err
-		}
-		err = q.writePayload(ctx, id, r, attrs)
-		if errors.Is(err, ErrPreconditionFailed) {
-			continue
-		}
-		if err != nil {
-			return "", err
-		}
-		return id, nil
+	id := newQueueID(q.clock())
+	if err := q.writePayload(ctx, id, r, attrs); err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("blobster: could not allocate a unique message id")
+	return id, nil
 }
 
 func (q *Queue) writePayload(ctx context.Context, id string, r io.Reader, attrs map[string]string) error {
@@ -431,4 +422,15 @@ func queueJitter(d time.Duration) time.Duration {
 	}
 	// Full jitter in [d, 2d) to spread contenders off the hot keyspace.
 	return d + time.Duration(rand.Int64N(int64(d)))
+}
+
+// newQueueID returns a message id that sorts lexicographically by creation time:
+// a zero-padded millisecond timestamp followed by a random UUID, joined by a dash.
+// The timestamp is the load-bearing part — fixed-width (20 digits, the full int64
+// range) and big-endian decimal, so lexical order tracks time, which is what gives
+// the queue its approximate-FIFO discovery order. The UUID only breaks ties within
+// a millisecond, keeping ids unique with no hot shared counter. The clock is
+// injected so tests can drive ordering deterministically.
+func newQueueID(now time.Time) string {
+	return fmt.Sprintf("%020d-%s", now.UnixMilli(), uuid.New())
 }
