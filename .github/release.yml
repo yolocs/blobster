@@ -1,0 +1,26 @@
+# Controls how `gh release create --generate-notes` groups PRs in the
+# auto-generated release notes. PRs are bucketed by label; the catch-all "*"
+# category collects anything unlabeled.
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking
+    - title: Features
+      labels:
+        - feature
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - bug
+        - fix
+    - title: Documentation
+      labels:
+        - docs
+        - documentation
+    - title: Other Changes
+      labels:
+        - "*"
