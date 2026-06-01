@@ -59,31 +59,85 @@ func (c *manualClock) Advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// faultBucket wraps a real bucket and injects faults into WriteAll. It is fault
-// injection at the backend seam (delegating real storage to the embedded
-// bucket), not a storage mock, so it stays within the testing standards.
+// faultBucket wraps a real bucket and injects faults at the WriteAll, Delete, and
+// Attributes seams. It is fault injection at the backend seam (delegating real
+// storage to the embedded bucket), not a storage mock, so it stays within the
+// testing standards. The hooks are shared through Sub so that injection survives
+// the internal Sub that utilities like the queue perform when they re-root onto a
+// prefix — without that, a hook set on the outer bucket would never see the
+// sub-bucket's calls.
+type faultHooks struct {
+	mu           sync.Mutex
+	onWriteAll   func(key string) error
+	onDelete     func(key string) error
+	onAttributes func(key string) error
+}
+
 type faultBucket struct {
 	blobster.Bucket
-	mu         sync.Mutex
-	onWriteAll func(key string) error
+	hooks *faultHooks
+}
+
+func newFaultBucket(b blobster.Bucket) *faultBucket {
+	return &faultBucket{Bucket: b, hooks: &faultHooks{}}
+}
+
+func (f *faultBucket) Sub(prefix string) blobster.Bucket {
+	return &faultBucket{Bucket: f.Bucket.Sub(prefix), hooks: f.hooks}
 }
 
 func (f *faultBucket) setWriteAllHook(fn func(key string) error) {
-	f.mu.Lock()
-	f.onWriteAll = fn
-	f.mu.Unlock()
+	f.hooks.mu.Lock()
+	f.hooks.onWriteAll = fn
+	f.hooks.mu.Unlock()
+}
+
+func (f *faultBucket) setDeleteHook(fn func(key string) error) {
+	f.hooks.mu.Lock()
+	f.hooks.onDelete = fn
+	f.hooks.mu.Unlock()
+}
+
+func (f *faultBucket) setAttributesHook(fn func(key string) error) {
+	f.hooks.mu.Lock()
+	f.hooks.onAttributes = fn
+	f.hooks.mu.Unlock()
 }
 
 func (f *faultBucket) WriteAll(ctx context.Context, key string, p []byte, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
-	f.mu.Lock()
-	hook := f.onWriteAll
-	f.mu.Unlock()
+	f.hooks.mu.Lock()
+	hook := f.hooks.onWriteAll
+	f.hooks.mu.Unlock()
 	if hook != nil {
 		if err := hook(key); err != nil {
 			return err
 		}
 	}
 	return f.Bucket.WriteAll(ctx, key, p, opts, preconditions...)
+}
+
+func (f *faultBucket) Delete(ctx context.Context, key string, preconditions ...blobster.Precondition) error {
+	f.hooks.mu.Lock()
+	hook := f.hooks.onDelete
+	f.hooks.mu.Unlock()
+	if hook != nil {
+		if err := hook(key); err != nil {
+			return err
+		}
+	}
+	return f.Bucket.Delete(ctx, key, preconditions...)
+}
+
+func (f *faultBucket) Attributes(ctx context.Context, key string) (*blobster.Attributes, error) {
+	f.hooks.mu.Lock()
+	hook := f.hooks.onAttributes
+	f.hooks.mu.Unlock()
+	if hook != nil {
+		if err := hook(key); err != nil {
+			return nil, err
+		}
+	}
+	return f.Bucket.Attributes(ctx, key)
 }
 
 func TestLockerAcquireReleaseReacquire(t *testing.T) {
@@ -345,7 +399,7 @@ func TestLockerRenewKeepsLockHeld(t *testing.T) {
 func TestLockerRenewSurvivesTransientError(t *testing.T) {
 	t.Parallel()
 	clock := newManualClock()
-	fb := &faultBucket{Bucket: mem.New()}
+	fb := newFaultBucket(mem.New())
 	l := blobster.NewLocker(fb,
 		blobster.WithLockClock(clock.Now),
 		blobster.WithLeaseDuration(30*time.Second),
@@ -395,7 +449,7 @@ func TestLockerRenewSurvivesTransientError(t *testing.T) {
 func TestLockerSurfacesBackendError(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("backend exploded")
-	fb := &faultBucket{Bucket: mem.New()}
+	fb := newFaultBucket(mem.New())
 	fb.setWriteAllHook(func(string) error { return sentinel })
 	l := blobster.NewLocker(fb, blobster.WithRetryInterval(time.Millisecond))
 	ctx := t.Context()

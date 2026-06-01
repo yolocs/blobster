@@ -62,7 +62,7 @@ message as an immutable payload plus a separate lease record; handlers must be
 idempotent (delivery is at-least-once).
 
 ```go
-q, err := blobster.NewQueue(bucket, "jobs/", blobster.WithVisibilityLease(15*time.Second))
+q, err := blobster.NewQueue(bucket, "jobs/", blobster.WithQueueVisibilityLease(15*time.Second))
 if err != nil {
 	return err
 }

@@ -676,7 +676,7 @@ collides with caller keys — the queue's prefix is a **caller-supplied required
 argument with no default**, and the queue owns everything beneath it (`msg/` and
 `lease/`). There is nothing to collide with because the caller dedicates the
 prefix to the queue. **Sharding is the caller's composition**: run N queues over
-N prefixes to spread load past a single prefix's request-rate ceiling. `New`
+N prefixes to spread load past a single prefix's request-rate ceiling. `NewQueue`
 returns `ErrInvalidQueuePrefix` for an empty or subtree-escaping prefix (the one
 construction error; the lock validates its key per-acquire instead, but the
 queue's prefix is fixed at construction, so it is validated there).

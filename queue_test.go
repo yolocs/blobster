@@ -8,6 +8,7 @@ import (
 	"io"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -167,7 +168,7 @@ func TestQueueTakeoverIncrementsReceives(t *testing.T) {
 		// purely by the clock.
 		q := mustNewQueue(t, bucket, "jobs/",
 			blobster.WithQueueClock(clock.Now),
-			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueVisibilityLease(30*time.Second),
 			blobster.WithQueueRenewInterval(time.Hour),
 		)
 		enqueueString(t, q, "work", nil)
@@ -252,7 +253,7 @@ func TestQueueAckAfterTakeoverIsNoOp(t *testing.T) {
 		clock := newManualClock()
 		q := mustNewQueue(t, bucket, "jobs/",
 			blobster.WithQueueClock(clock.Now),
-			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueVisibilityLease(30*time.Second),
 			blobster.WithQueueRenewInterval(time.Hour),
 		)
 		id := enqueueString(t, q, "work", nil)
@@ -302,7 +303,7 @@ func TestQueueLostNotification(t *testing.T) {
 		clock := newManualClock()
 		q := mustNewQueue(t, bucket, "jobs/",
 			blobster.WithQueueClock(clock.Now),
-			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueVisibilityLease(30*time.Second),
 			blobster.WithQueueRenewInterval(10*time.Millisecond),
 		)
 		id := enqueueString(t, q, "work", nil)
@@ -339,7 +340,7 @@ func TestQueueRenewKeepsMessageHeld(t *testing.T) {
 		clock := newManualClock()
 		q := mustNewQueue(t, bucket, "jobs/",
 			blobster.WithQueueClock(clock.Now),
-			blobster.WithVisibilityLease(30*time.Second),
+			blobster.WithQueueVisibilityLease(30*time.Second),
 			blobster.WithQueueRenewInterval(20*time.Millisecond),
 		)
 		id := enqueueString(t, q, "work", nil)
@@ -380,10 +381,10 @@ func TestQueueRenewKeepsMessageHeld(t *testing.T) {
 func TestQueueRenewSurvivesTransientError(t *testing.T) {
 	t.Parallel()
 	clock := newManualClock()
-	fb := &faultBucket{Bucket: mem.New()}
+	fb := newFaultBucket(mem.New())
 	q := mustNewQueue(t, fb, "jobs/",
 		blobster.WithQueueClock(clock.Now),
-		blobster.WithVisibilityLease(30*time.Second),
+		blobster.WithQueueVisibilityLease(30*time.Second),
 		blobster.WithQueueRenewInterval(10*time.Millisecond),
 	)
 	ctx := t.Context()
@@ -432,7 +433,7 @@ func TestQueueReceiveBlocksUntilEnqueued(t *testing.T) {
 	t.Parallel()
 	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
 		ctx := t.Context()
-		q := mustNewQueue(t, bucket, "jobs/", blobster.WithReceiveBackoff(10*time.Millisecond, 20*time.Millisecond))
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueReceiveBackoff(10*time.Millisecond, 20*time.Millisecond))
 
 		received := make(chan *blobster.Message, 1)
 		go func() {
@@ -470,7 +471,7 @@ func TestQueueReceiveBlocksUntilEnqueued(t *testing.T) {
 func TestQueueReceiveRespectsContextCancel(t *testing.T) {
 	t.Parallel()
 	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
-		q := mustNewQueue(t, bucket, "jobs/", blobster.WithReceiveBackoff(5*time.Millisecond, 10*time.Millisecond))
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueReceiveBackoff(5*time.Millisecond, 10*time.Millisecond))
 
 		t.Run("deadline", func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -501,9 +502,9 @@ func TestQueueCompetingConsumersDrainAll(t *testing.T) {
 		// non-atomic two-delete ack, which the test tolerates. Every message must
 		// be delivered at least once and the queue must fully drain.
 		q := mustNewQueue(t, bucket, "jobs/",
-			blobster.WithVisibilityLease(time.Minute),
+			blobster.WithQueueVisibilityLease(time.Minute),
 			blobster.WithQueueRenewInterval(time.Hour),
-			blobster.WithHeadWindow(512),
+			blobster.WithQueueHeadWindow(512),
 		)
 
 		const messages = 60
@@ -568,6 +569,13 @@ func TestQueueCompetingConsumersDrainAll(t *testing.T) {
 		defer mu.Unlock()
 		if len(distinct) != messages {
 			t.Fatalf("distinct delivered = %d, want %d (total deliveries %d)", len(distinct), messages, deliv.Load())
+		}
+		// At-least-once tolerates duplicates, but a redelivery storm (e.g. a
+		// regression that re-leases every message many times) should not pass
+		// silently: with a 1-minute lease and 1-hour renew nothing expires here, so
+		// duplicates can only come from the rare two-delete ack window.
+		if d := deliv.Load(); d > messages*2 {
+			t.Errorf("total deliveries = %d, want <= %d (excessive duplicates)", d, messages*2)
 		}
 		for id := range distinct {
 			if !want[id] {
@@ -715,4 +723,284 @@ func TestQueueNewIDSortableAndFixedWidth(t *testing.T) {
 			t.Fatalf("ids not lexically sorted by time at %d: %q vs %q", i, ids[i], sorted[i])
 		}
 	}
+}
+
+// TestQueueAckLeaseFirstOrdering verifies the load-bearing invariant of Ack: the
+// lease record is deleted strictly before the payload, so a crash between the two
+// deletes can only ever leave an available message, never an orphaned lease.
+func TestQueueAckLeaseFirstOrdering(t *testing.T) {
+	t.Parallel()
+	fb := newFaultBucket(mem.New())
+	q := mustNewQueue(t, fb, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
+	ctx := t.Context()
+	enqueueString(t, q, "work", nil)
+
+	msg, err := q.TryReceive(ctx)
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+
+	var mu sync.Mutex
+	var deleted []string
+	fb.setDeleteHook(func(key string) error {
+		mu.Lock()
+		deleted = append(deleted, key)
+		mu.Unlock()
+		return nil
+	})
+
+	if err := msg.Ack(ctx); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleted) != 2 {
+		t.Fatalf("recorded %d deletes, want 2: %v", len(deleted), deleted)
+	}
+	if !strings.HasPrefix(deleted[0], "lease/") {
+		t.Errorf("first delete = %q, want the lease record deleted first", deleted[0])
+	}
+	if !strings.HasPrefix(deleted[1], "msg/") {
+		t.Errorf("second delete = %q, want the payload deleted second", deleted[1])
+	}
+}
+
+// TestQueueCrashMidAckNoOrphan simulates a crash in the ack's two-delete window —
+// the lease delete lands, the payload delete fails — and verifies the result is an
+// available message (payload, no lease), redeliverable and drainable with no
+// orphaned lease left behind.
+func TestQueueCrashMidAckNoOrphan(t *testing.T) {
+	t.Parallel()
+	fb := newFaultBucket(mem.New())
+	q := mustNewQueue(t, fb, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
+	ctx := t.Context()
+	id := enqueueString(t, q, "work", nil)
+
+	first, err := q.TryReceive(ctx)
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+
+	// Fail only the payload delete: the lease delete (issued first) still lands.
+	fb.setDeleteHook(func(key string) error {
+		if strings.HasPrefix(key, "msg/") {
+			return errors.New("crash before payload delete")
+		}
+		return nil
+	})
+	if err := first.Ack(ctx); err == nil {
+		t.Fatal("Ack: expected the injected payload-delete failure")
+	}
+	fb.setDeleteHook(nil)
+
+	if ok, _ := fb.Exists(ctx, "jobs/lease/"+id); ok {
+		t.Fatal("lease record should be gone after the partial ack")
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/msg/"+id); !ok {
+		t.Fatal("payload should still exist after the partial ack (an available message)")
+	}
+
+	// The message is available again; a clean ack now removes everything.
+	second, err := q.TryReceive(ctx)
+	if err != nil {
+		t.Fatalf("redeliver: %v", err)
+	}
+	if second.ID() != id {
+		t.Fatalf("redelivered %q, want %q", second.ID(), id)
+	}
+	if err := second.Ack(ctx); err != nil {
+		t.Fatalf("second ack: %v", err)
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/lease/"+id); ok {
+		t.Error("orphan lease after drain")
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/msg/"+id); ok {
+		t.Error("orphan payload after drain")
+	}
+	if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+		t.Fatalf("queue not drained: %v", err)
+	}
+}
+
+// TestQueueClaimOrphanLeaseCleanup exercises the claim path where the payload
+// vanishes between listing and the attributes read — the race a previous owner's
+// lease-first ack can open. The claimer must drop the lease it just wrote rather
+// than leak it.
+func TestQueueClaimOrphanLeaseCleanup(t *testing.T) {
+	t.Parallel()
+	fb := newFaultBucket(mem.New())
+	q := mustNewQueue(t, fb, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
+	ctx := t.Context()
+	id := enqueueString(t, q, "doomed", nil)
+
+	// When the claimer reads the payload's attributes, delete the payload and
+	// report it gone — exactly what a racing ack would produce.
+	var once sync.Once
+	fb.setAttributesHook(func(key string) error {
+		if strings.HasPrefix(key, "msg/") {
+			once.Do(func() { _ = fb.Bucket.Delete(ctx, "jobs/"+key) })
+			return blobster.ErrNotFound
+		}
+		return nil
+	})
+
+	if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+		t.Fatalf("TryReceive: got %v, want ErrNoMessages after orphan cleanup", err)
+	}
+	fb.setAttributesHook(nil)
+
+	if ok, _ := fb.Exists(ctx, "jobs/lease/"+id); ok {
+		t.Error("claimer leaked a lease for a vanished payload")
+	}
+	if ok, _ := fb.Exists(ctx, "jobs/msg/"+id); ok {
+		t.Error("payload should be gone")
+	}
+}
+
+// TestQueueHeadWindowCrowding demonstrates the hazard the head window guards
+// against: leased-but-unacked messages stay listed and, when they fill the window,
+// crowd out the available messages behind them — until they are acked.
+func TestQueueHeadWindowCrowding(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueVisibilityLease(time.Minute),
+			blobster.WithQueueRenewInterval(time.Hour),
+			blobster.WithQueueHeadWindow(2), // far smaller than the backlog
+		)
+		const messages = 6
+		for i := range messages {
+			enqueueString(t, q, fmt.Sprintf("body-%d", i), nil)
+		}
+
+		// Hold the two lexically-earliest messages without acking; with a 2-key
+		// window they fill it entirely, starving discovery of the rest.
+		h1, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("receive 1: %v", err)
+		}
+		h2, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("receive 2: %v", err)
+		}
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("expected crowding starvation, got %v", err)
+		}
+
+		// Releasing the held ones lets discovery reach the rest; everything drains.
+		if err := h1.Ack(ctx); err != nil {
+			t.Fatalf("ack h1: %v", err)
+		}
+		if err := h2.Ack(ctx); err != nil {
+			t.Fatalf("ack h2: %v", err)
+		}
+		drained := 0
+		for {
+			msg, err := q.TryReceive(ctx)
+			if errors.Is(err, blobster.ErrNoMessages) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("drain receive: %v", err)
+			}
+			if err := msg.Ack(ctx); err != nil {
+				t.Fatalf("drain ack: %v", err)
+			}
+			drained++
+		}
+		if drained != messages-2 {
+			t.Fatalf("drained %d after releasing the held pair, want %d", drained, messages-2)
+		}
+	})
+}
+
+// TestQueueRenewerLeavesPayloadUntouched proves the renewer rewrites only the
+// empty-bodied lease record and never the payload — the structural reason a held
+// message of any size streams without the heartbeat re-uploading it.
+func TestQueueRenewerLeavesPayloadUntouched(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithQueueVisibilityLease(30*time.Second),
+			blobster.WithQueueRenewInterval(20*time.Millisecond),
+		)
+		id := enqueueString(t, q, "payload-stays-put", nil)
+
+		msg, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("receive: %v", err)
+		}
+		defer msg.Ack(ctx)
+
+		msgPath, leasePath := "jobs/msg/"+id, "jobs/lease/"+id
+		payload0, err := bucket.Attributes(ctx, msgPath)
+		if err != nil {
+			t.Fatalf("payload attrs: %v", err)
+		}
+		lease0, err := bucket.Attributes(ctx, leasePath)
+		if err != nil {
+			t.Fatalf("lease attrs: %v", err)
+		}
+
+		// Wait for a renew to land (lease version advances) under a frozen clock,
+		// then assert the payload version is unchanged.
+		deadline := time.Now().Add(2 * time.Second)
+		renewed := false
+		for time.Now().Before(deadline) {
+			if a, err := bucket.Attributes(ctx, leasePath); err == nil && a.Version != lease0.Version {
+				renewed = true
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !renewed {
+			t.Fatal("lease never renewed")
+		}
+		payloadN, err := bucket.Attributes(ctx, msgPath)
+		if err != nil {
+			t.Fatalf("payload attrs after renew: %v", err)
+		}
+		if payloadN.Version != payload0.Version {
+			t.Fatalf("payload version changed across renews: %q -> %q (renewer must not touch the payload)", payload0.Version, payloadN.Version)
+		}
+	})
+}
+
+// TestQueueMalformedLeaseRecordRecoverable verifies a lease record written out of
+// band with no deadline and a garbage receives count is treated as expired and
+// taken over, with a sane receives count — mirroring the lock's malformed-record
+// recovery.
+func TestQueueMalformedLeaseRecordRecoverable(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
+		id := enqueueString(t, q, "work", nil)
+
+		if err := bucket.WriteAll(ctx, "jobs/lease/"+id, nil, &blobster.WriterOptions{
+			Metadata:                    map[string]string{"owner": "ghost", "receives": "not-a-number"},
+			DisableContentTypeDetection: true,
+		}); err != nil {
+			t.Fatalf("seed malformed lease: %v", err)
+		}
+
+		msg, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("receive over malformed lease: %v", err)
+		}
+		if msg.ID() != id {
+			t.Fatalf("delivered %q, want %q", msg.ID(), id)
+		}
+		if msg.Receives() != 1 {
+			t.Fatalf("Receives = %d, want 1 (malformed count treated as 0, then +1)", msg.Receives())
+		}
+		if err := msg.Ack(ctx); err != nil {
+			t.Fatalf("ack: %v", err)
+		}
+	})
 }

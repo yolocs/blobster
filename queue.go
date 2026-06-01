@@ -97,11 +97,11 @@ type Queue struct {
 // QueueOption configures a Queue.
 type QueueOption func(*Queue)
 
-// WithVisibilityLease sets how long a claimed message stays invisible to other
+// WithQueueVisibilityLease sets how long a claimed message stays invisible to other
 // workers before its lease must be renewed. A crashed worker's message becomes
 // redeliverable this long after its last successful renew. Defaults to
 // DefaultVisibilityLease.
-func WithVisibilityLease(d time.Duration) QueueOption {
+func WithQueueVisibilityLease(d time.Duration) QueueOption {
 	return func(q *Queue) { q.lease = d }
 }
 
@@ -112,19 +112,19 @@ func WithQueueRenewInterval(d time.Duration) QueueOption {
 	return func(q *Queue) { q.renew = d }
 }
 
-// WithHeadWindow sets how many keys Receive lists from the head of the message
+// WithQueueHeadWindow sets how many keys Receive lists from the head of the message
 // keyspace per attempt. Size it above the worker count so leased-but-unacked
 // messages — whose payloads stay listed until acked — do not crowd out available
 // ones. Defaults to DefaultHeadWindow.
-func WithHeadWindow(n int) QueueOption {
+func WithQueueHeadWindow(n int) QueueOption {
 	return func(q *Queue) { q.headWindow = n }
 }
 
-// WithReceiveBackoff sets the empty-queue poll backoff for the blocking Receive:
+// WithQueueReceiveBackoff sets the empty-queue poll backoff for the blocking Receive:
 // the wait starts at low, doubles (jittered) up to high while the queue stays
 // empty, and resets on the next claim. Defaults to DefaultMinPollInterval and
 // DefaultMaxPollInterval.
-func WithReceiveBackoff(low, high time.Duration) QueueOption {
+func WithQueueReceiveBackoff(low, high time.Duration) QueueOption {
 	return func(q *Queue) {
 		q.minPoll = low
 		q.maxPoll = high
