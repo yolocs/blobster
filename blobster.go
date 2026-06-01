@@ -43,6 +43,7 @@ type Bucket interface {
 	ReadAll(ctx context.Context, key string) ([]byte, error)
 	SignedURL(ctx context.Context, key string, opts *SignedURLOptions) (string, error)
 	Sub(prefix string) Bucket
+	UpdateMetadata(ctx context.Context, key string, md map[string]string) (newVersion string, err error)
 	Upload(ctx context.Context, key string, r io.Reader, opts *WriterOptions, preconditions ...Precondition) error
 	WriteAll(ctx context.Context, key string, p []byte, opts *WriterOptions, preconditions ...Precondition) error
 	Capabilities() Capabilities

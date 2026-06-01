@@ -110,6 +110,7 @@ NewWriter(ctx, key, *WriterOptions) (Writer, error)   // streaming write; commit
 ReadAll(ctx, key) ([]byte, error)
 SignedURL(ctx, key, *SignedURLOptions) (string, error)
 Sub(prefix) Bucket
+UpdateMetadata(ctx, key, map[string]string) (newVersion, error)  // unconditional metadata-only update
 Upload(ctx, key, io.Reader, *WriterOptions, ...Precondition) error
 WriteAll(ctx, key, []byte, *WriterOptions, ...Precondition) error
 Capabilities() Capabilities
@@ -118,6 +119,13 @@ Capabilities() Capabilities
 - **`Attributes`** carries an opaque **version token** (an ETag, a GCS
   generation, an Azure ETag) that feeds conditional operations. blobster does
   not interpret it beyond equality.
+- **`UpdateMetadata`** changes an object's user metadata **in place** (the body
+  is untouched) and returns the object's current version token. It has **replace
+  semantics**: the supplied map is the complete desired metadata and replaces the
+  prior map in full (a nil/empty map clears it); merge/patch is not portable
+  across backends. It is **unconditional** — see
+  [Metadata-only update](#metadata-only-update) for why it takes no precondition
+  and for the per-backend mechanism.
 - **`NewWriter`** returns a `Writer` whose bytes are committed on `Close`; a
   writer abandoned via `CloseWithError`, its cancelable context, or a context
   cancel must **not** leave a partial, readable object. This matters for
@@ -172,6 +180,40 @@ atomic op — blobster needs no CAS-to-tombstone workaround. Every backend retur
 **HTTP 412** on a failed precondition, mapped to `ErrPreconditionFailed`; the
 per-SDK error matching is recorded in
 [`cloud-backend-research.md`](cloud-backend-research.md).
+
+### Metadata-only update
+
+`UpdateMetadata` is a **base `Bucket` operation** (every driver implements it),
+not an optional capability: all five drivers can replace an object's user
+metadata without re-uploading the body, so there is no backend that lacks it. It
+takes no precondition — the supplied map unconditionally replaces the prior user
+metadata (empty/nil clears it) and the call returns the object's current version
+token (free from every SDK, handy for refreshing a cached token):
+
+| Backend | Mechanism |
+|---------|-----------|
+| `mem`   | rewrite metadata under the lock, bump the in-process version |
+| `file`  | rewrite the JSON sidecar atomically under the per-bucket lock; data file (body + its ModTime) untouched; new version token |
+| `s3`    | `CopyObject` onto the same key with `MetadataDirective=REPLACE`; system headers (content-type, …) re-supplied from current attributes because `REPLACE` drops them |
+| `gcs`   | `ObjectHandle.Update` with a metadata patch |
+| `azureblob` | `Set Blob Metadata`; the fresh ETag is the new version |
+
+**Why no precondition.** A precondition exists for optimistic concurrency, but a
+conditional metadata update cannot be honored uniformly: on s3 the version token
+is the object **ETag**, a content hash that a metadata-only self-copy leaves
+**unchanged**, and s3 has no metageneration analog (the one GCS would lean on).
+So "CAS on metadata" would be unenforceable on s3 — a footgun that looks atomic
+but silently lets two metadata updates both win. Per invariant 5, a coordination
+primitive that blob storage can't express uniformly is the thing to drop, not to
+paper over with a per-backend caveat. The use cases that motivate the operation —
+in-place tagging, object state, content-property updates — need only an
+unconditional replace. A caller that genuinely needs optimistic concurrency on
+small state keeps that state in the **body** of a tiny object and uses
+`WriteAll`'s CAS, which every backend advances correctly (the same shape the
+queue's per-message lease uses). A conditional variant (or an optional
+`MetadataUpdater`) can be added later, additively, if a concrete consumer appears
+and we know which backends must support it; shipping a half-working one now and
+removing it would be the breaking change.
 
 ## Optional capabilities
 

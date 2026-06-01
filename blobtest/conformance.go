@@ -222,6 +222,67 @@ func TestBucket(t *testing.T, newBucket BucketFactory) {
 		}
 	})
 
+	t.Run("update metadata replaces the map and preserves the body", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		bucket := newBucket(t)
+
+		opts := &blobster.WriterOptions{
+			ContentType: "text/plain",
+			Metadata:    map[string]string{"owner": "alice", "stage": "start"},
+		}
+		if err := bucket.WriteAll(ctx, "md", []byte("body one"), opts); err != nil {
+			t.Fatalf("WriteAll: %v", err)
+		}
+
+		version, err := bucket.UpdateMetadata(ctx, "md", map[string]string{"stage": "done"})
+		if err != nil {
+			t.Fatalf("UpdateMetadata: %v", err)
+		}
+		if version == "" {
+			t.Fatal("UpdateMetadata returned an empty version token")
+		}
+
+		attrs, err := bucket.Attributes(ctx, "md")
+		if err != nil {
+			t.Fatalf("Attributes: %v", err)
+		}
+		// Replace, not merge: "owner" is gone and only "stage" remains.
+		if diff := cmp.Diff(map[string]string{"stage": "done"}, attrs.Metadata); diff != "" {
+			t.Fatalf("metadata after update mismatch (-want +got):\n%s", diff)
+		}
+		if attrs.ContentType != "text/plain" {
+			t.Fatalf("ContentType after update = %q, want text/plain (preserved)", attrs.ContentType)
+		}
+		if attrs.Version != version {
+			t.Fatalf("Attributes.Version = %q, want returned token %q", attrs.Version, version)
+		}
+		body, err := bucket.ReadAll(ctx, "md")
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if string(body) != "body one" {
+			t.Fatalf("body after update = %q, want body one (preserved)", string(body))
+		}
+
+		// Clearing: an empty map drops all user metadata.
+		if _, err := bucket.UpdateMetadata(ctx, "md", nil); err != nil {
+			t.Fatalf("UpdateMetadata clear: %v", err)
+		}
+		cleared, err := bucket.Attributes(ctx, "md")
+		if err != nil {
+			t.Fatalf("Attributes after clear: %v", err)
+		}
+		if len(cleared.Metadata) != 0 {
+			t.Fatalf("metadata after clear = %v, want empty", cleared.Metadata)
+		}
+
+		// A missing key reports ErrNotFound.
+		if _, err := bucket.UpdateMetadata(ctx, "absent", map[string]string{"k": "v"}); !errors.Is(err, blobster.ErrNotFound) {
+			t.Fatalf("UpdateMetadata on missing key error = %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("concurrent create-only writes have exactly one winner", func(t *testing.T) {
 		t.Parallel()
 		ctx := t.Context()

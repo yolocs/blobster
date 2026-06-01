@@ -276,6 +276,34 @@ func (b *Bucket) Sub(prefix string) blobster.Bucket {
 	}
 }
 
+func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	normalized, err := blobster.NormalizeMetadata(md)
+	if err != nil {
+		return "", err
+	}
+
+	b.state.mu.Lock()
+	defer b.state.mu.Unlock()
+
+	fullKey := b.objectKey(key)
+	current, exists := b.state.objects[fullKey]
+	if !exists {
+		return "", fmt.Errorf("%w: %s", blobster.ErrNotFound, key)
+	}
+
+	b.state.nextVersion++
+	attrs := current.attrs.Clone()
+	attrs.Metadata = blobster.CloneMetadata(normalized)
+	attrs.ModTime = time.Now()
+	attrs.Version = strconv.FormatUint(b.state.nextVersion, 10)
+	attrs.Native = nil
+	b.state.objects[fullKey] = object{data: current.data, attrs: attrs}
+	return attrs.Version, nil
+}
+
 func (b *Bucket) Upload(ctx context.Context, key string, r io.Reader, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
 	cloned, err := blobster.RequireUploadOptions(opts)
 	if err != nil {

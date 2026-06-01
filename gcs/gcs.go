@@ -198,6 +198,14 @@ func (b *Bucket) Sub(prefix string) blobster.Bucket {
 	}
 }
 
+func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error) {
+	normalized, err := blobster.NormalizeMetadata(md)
+	if err != nil {
+		return "", err
+	}
+	return b.backend.UpdateMetadata(ctx, b.objectKey(key), normalized)
+}
+
 func (b *Bucket) Upload(ctx context.Context, key string, r io.Reader, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
 	cloned, err := blobster.RequireUploadOptions(opts)
 	if err != nil {
@@ -241,6 +249,7 @@ type backend interface {
 	Attributes(ctx context.Context, key string) (*blobster.Attributes, error)
 	NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error)
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
+	UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
 	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
 	XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error)
@@ -320,6 +329,21 @@ func (b *storageBackend) NewWriter(ctx context.Context, key string, opts *blobst
 		}
 	}
 	return &writeCloser{w: writer}, nil
+}
+
+func (b *storageBackend) UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error) {
+	// Replace semantics: a non-nil (possibly empty) map replaces the whole user
+	// metadata. The SDK reads nil as "leave unchanged", so a nil/empty md is sent
+	// as an empty map to clear it. A metadata-only update bumps metageneration but
+	// not generation, so the returned (generation) token may equal the prior one.
+	if md == nil {
+		md = map[string]string{}
+	}
+	attrs, err := b.object(key).Update(ctx, storage.ObjectAttrsToUpdate{Metadata: md})
+	if err != nil {
+		return "", mapError(err)
+	}
+	return strconv.FormatInt(attrs.Generation, 10), nil
 }
 
 func (b *storageBackend) Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error {

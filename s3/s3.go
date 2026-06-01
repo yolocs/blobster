@@ -192,6 +192,14 @@ func (b *Bucket) Sub(prefix string) blobster.Bucket {
 	}
 }
 
+func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error) {
+	normalized, err := blobster.NormalizeMetadata(md)
+	if err != nil {
+		return "", err
+	}
+	return b.backend.UpdateMetadata(ctx, b.objectKey(key), normalized)
+}
+
 func (b *Bucket) Upload(ctx context.Context, key string, r io.Reader, opts *blobster.WriterOptions, preconditions ...blobster.Precondition) error {
 	cloned, err := blobster.RequireUploadOptions(opts)
 	if err != nil {
@@ -235,6 +243,7 @@ type backend interface {
 	Attributes(ctx context.Context, key string) (*blobster.Attributes, error)
 	NewRangeReader(ctx context.Context, key string, offset, length int64, opts *blobster.ReaderOptions) (blobster.Reader, error)
 	NewWriter(ctx context.Context, key string, opts *blobster.WriterOptions, preconditions blobster.Preconditions) (blobster.Writer, error)
+	UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error)
 	Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error
 	Copy(ctx context.Context, dstKey, srcKey string, opts *blobster.CopyOptions) error
 	XCopyFrom(ctx context.Context, dstKey string, src backend, srcKey string, opts *blobster.CopyOptions) (*blobster.CopyOperation, error)
@@ -384,6 +393,50 @@ func (b *s3Backend) NewWriter(ctx context.Context, key string, opts *blobster.Wr
 		close(w.done)
 	}()
 	return w, nil
+}
+
+func (b *s3Backend) UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error) {
+	// S3 has no metadata-only update; the closest server-side operation is a
+	// self-copy with MetadataDirective=REPLACE, which preserves the body but
+	// requires every system header to be re-supplied (REPLACE drops the ones not
+	// set on the request), so read the current attributes first. Reading also
+	// honors the ErrNotFound contract before the copy.
+	cur, err := b.Attributes(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	input := &s3.CopyObjectInput{
+		Bucket:            aws.String(b.bucket),
+		Key:               aws.String(key),
+		CopySource:        aws.String(copySource(b.bucket, key)),
+		MetadataDirective: types.MetadataDirectiveReplace,
+	}
+	if len(md) > 0 {
+		input.Metadata = md
+	}
+	if cur.CacheControl != "" {
+		input.CacheControl = aws.String(cur.CacheControl)
+	}
+	if cur.ContentDisposition != "" {
+		input.ContentDisposition = aws.String(cur.ContentDisposition)
+	}
+	if cur.ContentEncoding != "" {
+		input.ContentEncoding = aws.String(cur.ContentEncoding)
+	}
+	if cur.ContentLanguage != "" {
+		input.ContentLanguage = aws.String(cur.ContentLanguage)
+	}
+	if cur.ContentType != "" {
+		input.ContentType = aws.String(cur.ContentType)
+	}
+	out, err := b.client.CopyObject(ctx, input)
+	if err != nil {
+		return "", mapError(err)
+	}
+	if out.CopyObjectResult == nil {
+		return "", nil
+	}
+	return etagVersion(out.CopyObjectResult.ETag), nil
 }
 
 func (b *s3Backend) Delete(ctx context.Context, key string, preconditions blobster.Preconditions) error {
