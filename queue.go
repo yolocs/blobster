@@ -79,8 +79,8 @@ const queueJitterWindow = 16
 // The model is at-least-once: a worker that crashes mid-processing has its lease
 // expire and the message redelivered, so handlers must be idempotent — the same
 // liveness-not-safety contract the lock documents. Ordering is approximate: ids
-// are a zero-padded millisecond timestamp plus a random UUID (lexically sortable
-// by time), and workers prefer the lexically-earliest available message, but
+// are an epoch-millisecond timestamp plus a random UUID (lexically sortable by
+// time), and workers prefer the lexically-earliest available message, but
 // concurrency, clock skew, and redelivery make it best-effort only.
 //
 // A Queue is safe for concurrent use; construct one per prefix with NewQueue and
@@ -425,12 +425,13 @@ func queueJitter(d time.Duration) time.Duration {
 }
 
 // newQueueID returns a message id that sorts lexicographically by creation time:
-// a zero-padded millisecond timestamp followed by a random UUID, joined by a dash.
-// The timestamp is the load-bearing part — fixed-width (20 digits, the full int64
-// range) and big-endian decimal, so lexical order tracks time, which is what gives
-// the queue its approximate-FIFO discovery order. The UUID only breaks ties within
-// a millisecond, keeping ids unique with no hot shared counter. The clock is
-// injected so tests can drive ordering deterministically.
+// an epoch-millisecond timestamp followed by a random UUID, joined by a dash. The
+// timestamp is the load-bearing part — lexical order tracks time, which gives the
+// queue its approximate-FIFO discovery order; the UUID only breaks ties within a
+// millisecond, keeping ids unique with no hot shared counter. It is width-padded
+// to 13 digits, the natural width of epoch milliseconds (and a constant from year
+// 2001 to 2286), so the decimal string sorts in the same order as the number. The
+// clock is injected so tests can drive ordering deterministically.
 func newQueueID(now time.Time) string {
-	return fmt.Sprintf("%020d-%s", now.UnixMilli(), uuid.New())
+	return fmt.Sprintf("%013d-%s", now.UnixMilli(), uuid.New())
 }

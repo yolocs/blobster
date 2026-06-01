@@ -664,14 +664,15 @@ above the worker count or they crowd out available messages. Claim-race losers
 (`ErrPreconditionFailed`) fall through to the next candidate; an empty pass backs
 off exponentially with jitter up to a cap.
 
-**Ids sort by time.** A message id is a zero-padded millisecond timestamp (20
-digits — the full int64 range, so the width is fixed for all time) joined to a
-random UUID by a dash. The fixed-width, big-endian decimal timestamp is the
+**Ids sort by time.** A message id is an epoch-millisecond timestamp joined to a
+random UUID by a dash (e.g. `1767225600000-<uuid>`). The decimal timestamp is the
 load-bearing part: lexical order tracks creation time, which gives the
 approximate-FIFO listing order, with no hot shared counter; the UUID only breaks
-ties within a millisecond. (A naive variable-width integer or an `RFC3339Nano`
-stamp, which trims trailing zeros, would not sort lexically — hence the padding.)
-The clock is injectable for deterministic tests.
+ties within a millisecond. The timestamp is width-padded to 13 digits — the
+natural, and constant, width of epoch milliseconds from 2001 to 2286 — so the
+string sorts in the same order as the number. (An unpadded value that crossed a
+digit-count boundary, or an `RFC3339Nano` stamp, which trims trailing zeros, would
+not sort lexically.) The clock is injectable for deterministic tests.
 
 **The prefix is required and owned wholesale.** Unlike the lock and multipart —
 whose bookkeeping lives under the reserved `.blobster/` subtree so it never
