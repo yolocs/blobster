@@ -43,11 +43,6 @@ func TestCloudBucket(t *testing.T) {
 		cleanupS3Objects(context.Background(), t, client, bucketName, prefix)
 	})
 
-	// Note: the s3 driver deliberately does not run
-	// blobtest.TestBucketMetadataAdvancesVersion. Its version token is the object
-	// ETag — a content hash that a metadata-only self-copy leaves unchanged — so
-	// UpdateMetadata returns the same token and cannot advance the version on a
-	// metadata-only change (see docs/architecture.md).
 	blobtest.TestBucket(t, func(t *testing.T) blobster.Bucket {
 		t.Helper()
 		return s3.New(client, bucketName, s3.WithPrefix(prefix))
@@ -96,11 +91,6 @@ func TestCloudBucketR2(t *testing.T) {
 		cleanupS3Objects(context.Background(), t, client, bucketName, prefix)
 	})
 
-	// Note: the s3 driver deliberately does not run
-	// blobtest.TestBucketMetadataAdvancesVersion. Its version token is the object
-	// ETag — a content hash that a metadata-only self-copy leaves unchanged — so
-	// UpdateMetadata returns the same token and cannot advance the version on a
-	// metadata-only change (see docs/architecture.md).
 	blobtest.TestBucket(t, func(t *testing.T) blobster.Bucket {
 		t.Helper()
 		return s3.New(client, bucketName, s3.WithPrefix(prefix))

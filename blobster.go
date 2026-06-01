@@ -43,7 +43,7 @@ type Bucket interface {
 	ReadAll(ctx context.Context, key string) ([]byte, error)
 	SignedURL(ctx context.Context, key string, opts *SignedURLOptions) (string, error)
 	Sub(prefix string) Bucket
-	UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions ...Precondition) (newVersion string, err error)
+	UpdateMetadata(ctx context.Context, key string, md map[string]string) (newVersion string, err error)
 	Upload(ctx context.Context, key string, r io.Reader, opts *WriterOptions, preconditions ...Precondition) error
 	WriteAll(ctx context.Context, key string, p []byte, opts *WriterOptions, preconditions ...Precondition) error
 	Capabilities() Capabilities
@@ -356,27 +356,6 @@ func PrepareWriteAllOptions(opts *WriterOptions, p []byte) (*WriterOptions, erro
 		out.ContentMD5 = sum[:]
 	}
 	return out, nil
-}
-
-// PrepareUpdateMetadata validates the inputs to a Bucket.UpdateMetadata call. It
-// normalizes the replacement metadata map (lowercased keys, no empty or
-// duplicate keys, like WriterOptions) and compiles the preconditions. IfNotExists
-// is rejected: UpdateMetadata mutates an existing object's metadata in place, so
-// "update only if absent" is contradictory — no backend can express it, and it
-// would otherwise always fail. IfMatch/IfNotMatch are passed through.
-func PrepareUpdateMetadata(md map[string]string, preconditions []Precondition) (map[string]string, Preconditions, error) {
-	normalized, err := NormalizeMetadata(md)
-	if err != nil {
-		return nil, Preconditions{}, err
-	}
-	compiled, err := CompilePreconditions(preconditions)
-	if err != nil {
-		return nil, Preconditions{}, err
-	}
-	if compiled.IfNotExists {
-		return nil, Preconditions{}, fmt.Errorf("%w: IfNotExists is not meaningful for UpdateMetadata", ErrInvalidOption)
-	}
-	return normalized, compiled, nil
 }
 
 func RequireUploadOptions(opts *WriterOptions) (*WriterOptions, error) {

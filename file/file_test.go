@@ -20,14 +20,6 @@ func TestBucket(t *testing.T) {
 	})
 }
 
-func TestBucketMetadataAdvancesVersion(t *testing.T) {
-	t.Parallel()
-	blobtest.TestBucketMetadataAdvancesVersion(t, func(t *testing.T) blobster.Bucket {
-		t.Helper()
-		return file.New(t.TempDir())
-	})
-}
-
 func TestBucketRejectsKeysEscapingRoot(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()

@@ -344,11 +344,11 @@ func (b *Bucket) Sub(prefix string) blobster.Bucket {
 	}
 }
 
-func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string, preconditions ...blobster.Precondition) (string, error) {
+func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	normalized, compiled, err := blobster.PrepareUpdateMetadata(md, preconditions)
+	normalized, err := blobster.NormalizeMetadata(md)
 	if err != nil {
 		return "", err
 	}
@@ -366,9 +366,6 @@ func (b *Bucket) UpdateMetadata(ctx context.Context, key string, md map[string]s
 	}
 	if !exists {
 		return "", fmt.Errorf("%w: %s", blobster.ErrNotFound, key)
-	}
-	if !conditionsPass(compiled, current, true) {
-		return "", fmt.Errorf("%w: %s", blobster.ErrPreconditionFailed, key)
 	}
 
 	// Rewrite only the metadata sidecar; the data file (existence and body source

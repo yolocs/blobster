@@ -15,11 +15,3 @@ func TestBucket(t *testing.T) {
 		return mem.New()
 	})
 }
-
-func TestBucketMetadataAdvancesVersion(t *testing.T) {
-	t.Parallel()
-	blobtest.TestBucketMetadataAdvancesVersion(t, func(t *testing.T) blobster.Bucket {
-		t.Helper()
-		return mem.New()
-	})
-}

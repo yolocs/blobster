@@ -39,14 +39,10 @@ func TestCloudBucket(t *testing.T) {
 		cleanupAzureBlobs(context.Background(), t, client, prefix)
 	})
 
-	newBucket := func(t *testing.T) blobster.Bucket {
+	blobtest.TestBucket(t, func(t *testing.T) blobster.Bucket {
 		t.Helper()
 		return azureblob.New(client, azureblob.WithPrefix(prefix))
-	}
-	blobtest.TestBucket(t, newBucket)
-	// Azure's Set Blob Metadata returns a fresh ETag, so the version token advances
-	// on a metadata-only update.
-	blobtest.TestBucketMetadataAdvancesVersion(t, newBucket)
+	})
 }
 
 // TestCloudCrossRegionCopy exercises the real CrossRegionCopier path: it writes
