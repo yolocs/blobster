@@ -25,10 +25,16 @@ Implemented:
   writes, streaming block-blob uploads, async server-side copy, SAS URLs)
 - shared conformance tests plus GCS, S3, and Azure cloud tests behind the
   `cloud` build tag
+- lease-based distributed lock (`blobster.NewLocker`) over the conditional-write
+  primitive
+- cross-region copy as an optional driver capability (`s3`, `gcs`, `azureblob`)
+- blob-backed work queue (`blobster.NewQueue`) — competing consumers,
+  at-least-once delivery, approximate FIFO, built on the conditional-write
+  primitive
 
 Planned:
 
-- multipart upload, distributed locks, and cross-region copy helpers
+- multipart parallel-upload helper
 
 ## Example
 
@@ -46,6 +52,35 @@ if err := bucket.WriteAll(ctx, "hello.txt", []byte("hello"), &blobster.WriterOpt
 }, blobster.IfNotExists); err != nil {
 	return err
 }
+```
+
+### Work queue
+
+`blobster.NewQueue` turns any bucket that supports conditional writes into a
+competing-consumers work queue. It owns a caller-supplied prefix and stores each
+message as an immutable payload plus a separate lease record; handlers must be
+idempotent (delivery is at-least-once).
+
+```go
+q, err := blobster.NewQueue(bucket, "jobs/", blobster.WithQueueVisibilityLease(15*time.Second))
+if err != nil {
+	return err
+}
+
+if _, err := q.Enqueue(ctx, strings.NewReader("do the thing"), nil); err != nil {
+	return err
+}
+
+msg, err := q.Receive(ctx) // polls with backoff until a message is claimed
+if err != nil {
+	return err
+}
+body, err := msg.ReadAll(ctx)
+if err != nil {
+	return msg.Nack(ctx) // return it for redelivery
+}
+_ = body
+return msg.Ack(ctx) // processed; remove it
 ```
 
 For tests:

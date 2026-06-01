@@ -87,6 +87,23 @@ pin the interface and are the test substrate everything else relies on.
     worthwhile for the genuinely resumable backends; the in-memory default stays
     for the simple/synchronous cases.
 
+### Blob-backed work queue
+- Work queue over the conditional-write primitive: competing consumers,
+  at-least-once delivery, approximate FIFO. **Built and shipped** in the root
+  package (`blobster.NewQueue(bucket, prefix, …)`), alongside the lock — it
+  depends only on the root contract and carries no cloud-specific logic. Two
+  objects per message — an immutable streamed
+  payload and a separate empty-bodied lease record managed exactly like the
+  lock's lease — so the heartbeat never re-uploads the payload. Enqueue / Receive
+  (poll with backoff) / TryReceive / Ack / Nack, time-sortable ids (epoch-
+  millisecond timestamp + UUID), and a
+  never-reset `receives` count surfaced on each message. Handlers must be
+  idempotent (the lock's liveness-not-safety contract, per message).
+  - **Follow-up — dead-letter / max-receives:** route a message aside once
+    `receives` crosses a threshold, rather than redelivering forever. Deliberately
+    split out of the first cut; the never-reset `receives` count already lets a
+    caller implement a poison-message policy by hand in the meantime.
+
 ### Cross-cutting
 - Signed/presigned URLs as a first-class capability (`SignedURLer`).
 - Observability seams (metrics/tracing hooks) that keep the root package free of
@@ -94,8 +111,6 @@ pin the interface and are the test substrate everything else relies on.
 - Readiness probe (`Pinger`) for services embedding blobster.
 
 ## Exploratory (not yet committed)
-- **Blob-backed queue** — enqueue/lease/ack over conditional writes and listing,
-  with visibility timeouts; the next coordination primitive after the lock.
 - **Resumable multipart** — persist an upload id so an interrupted large upload
   can continue across processes.
 - **Content addressing / dedup helpers** — write-by-digest and integrity
