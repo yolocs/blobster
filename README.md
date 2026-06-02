@@ -1,5 +1,8 @@
 # blobster
 
+<img width="2912" height="1440" alt="Gemini_Generated_Image_owsi9kowsi9kowsi" src="https://github.com/user-attachments/assets/feed8fd6-98e5-4851-9136-bc75ba1e006b" />
+
+
 Cloud-agnostic storage and coordination primitives built solely on blob storage.
 
 blobster is for teams that already have object storage everywhere and want to
