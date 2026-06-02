@@ -4,6 +4,8 @@
 // support; large writes stream through the SDK's multipart upload manager.
 package s3
 
+//lint:file-ignore SA1019 The s3 driver uses feature/s3/manager.Uploader for streaming multipart writes. Its replacement, feature/s3/transfermanager, is still pre-1.0 (v0.x); we stay on the fully-supported (deprecated) manager API until that lands a stable release.
+
 import (
 	"bytes"
 	"context"
