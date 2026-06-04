@@ -112,6 +112,54 @@ shipped surface.
     redirect dead letters into a separate queue instead of the in-prefix `dead/`;
     deferred and additive.
 
+### Fan-out replication (queue-to-queue watcher)
+
+Replicate one leader region's writes to many follower regions **without
+write-amplifying the leader**. The leader enqueues each change **once** into a
+blob-backed log (its queue's `msg/` keyspace); every follower **tails that log
+read-only** and re-enqueues the messages into its *own* regional queue, where
+ordinary workers consume them. Leader write cost stays O(1) in the number of
+followers; each region pays its own fan-in locally, off the leader's critical
+path. The naive alternative — the leader enqueuing into one queue per follower —
+amplifies the leader write by the follower count, which is what motivated this.
+
+The same queue is used in **two modes**: publish/broadcast on the leader (only
+`Enqueue` — followers cannot write the leader bucket to take leases, so it has no
+competing consumers) and ordinary competing-consumers on each follower. The
+bridge between them is a **watcher**: a singleton-per-region job (made HA by the
+lease lock, resumed from a durable cursor in the follower's own bucket after a
+shutdown) that lists the leader's `msg/` forward of its cursor and re-enqueues
+each new message locally. Built almost entirely from shipped pieces — the queue,
+the lock, conditional writes — plus a few additive primitives, each tracked as
+its own issue:
+
+- **Dedup-keyed enqueue** (`EnqueueWithID`, #22): the watcher enqueues each local
+  message under the *leader's* message id, create-only, so a crash/restart or a
+  brief two-watcher overlap re-enqueues harmlessly instead of duplicating. The
+  load-bearing new bit — without it the non-atomic "enqueue then advance cursor"
+  step would double-deliver.
+- **Queue retention / TTL trim** (`WithRetention`, #23): the "slow burner" — a
+  leader-side janitor that range-deletes `msg/` older than a horizon (sized above
+  worst-case follower lag), since a broadcast log has no consumer to ack it away.
+  Generally useful beyond replication, and the concrete form of the
+  "Lifecycle / retention helpers" exploratory item below.
+- **Tail/cursor reader** (#24): read-only, forward iteration of a queue's `msg/`
+  from a durable cursor, with a small **cursor lag** so a message
+  stamped-early-but-committed-late (the only real late-arrival hole, bounded by
+  payload write latency) is not skipped. Time-sortable ids give ordering and
+  double as the dedup key.
+- **The watcher** (#25): ties the tail to the dedup-enqueue under the lock with a
+  persisted cursor; the umbrella feature.
+
+Design notes settled in discussion: **bounded** message payloads (carried in the
+body) flow straight through the queue, so the watcher is a plain cross-region
+read + local write — provider-agnostic, no `CrossRegionCopier` dependency, works
+`mem`→`mem` in tests; a periodic **reconciliation sweep** is the longstop for
+anything the fast path drops (and the path a follower that fell past the
+retention horizon uses to re-bootstrap); and the head-of-line problem of a single
+progress marker is dissolved by pushing per-item failure into the *follower*
+queue, where dead-letter already handles poison messages.
+
 ### Cross-cutting
 - Signed/presigned URL hardening. `SignedURL` is already a base `Bucket`
   operation gated by `Capabilities().SignedURL`; future work is around signing
@@ -126,7 +174,8 @@ shipped surface.
 - **Content addressing / dedup helpers** — write-by-digest and integrity
   verification on the streamed path.
 - **Lifecycle / retention helpers** — TTL and cleanup conventions expressed over
-  the keyspace.
+  the keyspace. The first concrete instance is queue retention (`WithRetention`,
+  #23), graduated under "Fan-out replication" above.
 
 ## Explicitly out of scope (for now)
 - A domain model (packages, datasets, etc.) — that belongs to callers.
