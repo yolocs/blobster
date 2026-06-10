@@ -6,7 +6,8 @@
 // constructed from caller-owned cloud clients rather than ambient configuration
 // or driver registration side effects.
 //
-// The root package also provides a lease Locker, a blob-backed Queue, and the
-// CrossRegionCopier handle types. Concrete drivers live in subpackages such as
-// mem, file, s3, gcs, and azureblob.
+// The root package also provides a lease Locker, a blob-backed Queue (with a
+// read-only Tail view and retention Trim), a fan-out replication Watcher, and
+// the CrossRegionCopier handle types. Concrete drivers live in subpackages such
+// as mem, file, s3, gcs, and azureblob.
 package blobster

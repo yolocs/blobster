@@ -24,6 +24,9 @@ var (
 	// ErrInvalidQueuePrefix is returned by NewQueue when the prefix is empty or
 	// would escape its subtree.
 	ErrInvalidQueuePrefix = errors.New("blobster: invalid queue prefix")
+	// ErrInvalidMessageID is returned by Queue.EnqueueWithID when the supplied id
+	// is empty, is not a single path segment, or would escape the queue's keyspace.
+	ErrInvalidMessageID = errors.New("blobster: invalid message id")
 )
 
 // Default queue lease timing. The lease is second-scale for the same reason the
@@ -35,6 +38,11 @@ const (
 	DefaultMinPollInterval = 250 * time.Millisecond
 	DefaultMaxPollInterval = 5 * time.Second
 )
+
+// DefaultTrimBatch bounds how many entries one Trim pass removes, so a janitor
+// pass over a long backlog stays a short, predictable burst of requests rather
+// than an unbounded scan; the caller simply runs more passes.
+const DefaultTrimBatch = 256
 
 // Sub-prefixes, relative to the queue's owned prefix, that separate the immutable
 // payloads from the mutating lease records, and hold dead-lettered messages.
@@ -95,6 +103,7 @@ type Queue struct {
 	minPoll     time.Duration
 	maxPoll     time.Duration
 	maxReceives int
+	retention   time.Duration
 	clock       func() time.Time
 }
 
@@ -161,6 +170,23 @@ func WithMaxReceives(n int) QueueOption {
 	return func(q *Queue) { q.maxReceives = n }
 }
 
+// WithRetention sets the queue's retention horizon for Trim: a Trim pass
+// removes messages whose ids embed a timestamp older than now − d, along with
+// their lease records. Unset or non-positive (the default) disables retention
+// and makes Trim return an error.
+//
+// Retention exists for queues nobody acks empty — above all a broadcast log
+// that fan-out replication watchers tail read-only, which would otherwise grow
+// forever — and doubles as cleanup for abandoned messages on ordinary queues.
+// The horizon is a hard policy, not a liveness check (see Trim), so d must
+// comfortably exceed the worst-case time a message can sit unprocessed plus its
+// processing time; for a replicated log it must also exceed worst-case follower
+// lag plus downtime, or a lagging follower's cursor falls off the log and the
+// follower must re-bootstrap.
+func WithRetention(d time.Duration) QueueOption {
+	return func(q *Queue) { q.retention = d }
+}
+
 // NewQueue returns a Queue that stores its messages under prefix in bucket. The
 // prefix is required — there is no default — and the queue owns it wholesale;
 // sharding past a single prefix's request-rate ceiling is the caller's
@@ -213,6 +239,9 @@ func NewQueue(bucket Bucket, prefix string, opts ...QueueOption) (*Queue, error)
 	if q.maxReceives < 0 {
 		q.maxReceives = 0
 	}
+	if q.retention < 0 {
+		q.retention = 0
+	}
 	return q, nil
 }
 
@@ -246,6 +275,140 @@ func (q *Queue) Enqueue(ctx context.Context, r io.Reader, opts *EnqueueOptions) 
 		return "", err
 	}
 	return id, nil
+}
+
+// EnqueueWithID writes a message under a caller-supplied id, create-only, so
+// re-enqueuing the same logical message is an idempotent no-op rather than a
+// duplicate: when a payload with this id already exists, the call writes
+// nothing and reports existed=true. This is the dedup primitive an
+// at-least-once producer needs — above all the fan-out replication Watcher,
+// which re-enqueues leader messages under the leader's id so a crash between
+// "enqueue" and "advance cursor" replays harmlessly.
+//
+// The id must be a non-empty single path segment (no "/", no "..", not ".");
+// otherwise EnqueueWithID returns ErrInvalidMessageID. Approximate-FIFO
+// discovery relies on time-sortable ids, so a supplied id outside the queue's
+// "<13-digit-millis>-<suffix>" shape lands at its arbitrary lexical position —
+// the caller owns ordering — and, carrying no timestamp, is never removed by
+// Trim and never lag-gated by Tail.
+//
+// Create-only protects against a currently existing payload only: once a
+// message is acked (or trimmed) its id is free again, so a late re-enqueue of
+// an already-processed id re-creates it. A caller that needs an "already done"
+// record keeps it itself — the replication Watcher's forward-only cursor plays
+// that role.
+func (q *Queue) EnqueueWithID(ctx context.Context, id string, r io.Reader, opts *EnqueueOptions) (existed bool, err error) {
+	if err := validateQueueMessageID(id); err != nil {
+		return false, err
+	}
+	var attrs map[string]string
+	if opts != nil {
+		attrs = opts.Attributes
+	}
+	err = q.writePayload(ctx, id, r, attrs)
+	if errors.Is(err, ErrPreconditionFailed) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func validateQueueMessageID(id string) error {
+	if id == "" {
+		return fmt.Errorf("%w: empty id", ErrInvalidMessageID)
+	}
+	if strings.Contains(id, "/") || strings.Contains(id, "..") || id == "." {
+		return fmt.Errorf("%w: %q", ErrInvalidMessageID, id)
+	}
+	return nil
+}
+
+// Trim performs one bounded retention pass: it removes messages whose
+// time-sortable ids are older than the queue's retention horizon (now −
+// WithRetention) along with their lease records, plus any residual lease
+// records older than the horizon whose messages are already gone, and returns
+// how many entries it removed. It returns an error wrapping ErrInvalidOption
+// when the queue was built without WithRetention.
+//
+// Trim is a janitor over the keyspace, not a consumer: it takes no lease and
+// acks nothing — "older than the horizon" is a lexical key range because the id
+// carries its enqueue time, so no per-object attribute read is needed. The
+// caller schedules it (there is no background janitor); each pass removes at
+// most DefaultTrimBatch entries, so a long backlog takes several passes.
+// Concurrent passes are safe — deletes are idempotent — though their returned
+// counts may overlap; a caller that wants a single mover gates Trim behind a
+// Locker.
+//
+// The horizon is a hard policy, not a liveness check: a message older than the
+// horizon is removed even if a worker currently holds its lease (that worker
+// observes ErrMessageLost), so size the retention per WithRetention's floor.
+// Caller-supplied ids outside the time-sortable shape carry no timestamp and
+// are never trimmed.
+func (q *Queue) Trim(ctx context.Context) (int, error) {
+	if q.retention <= 0 {
+		return 0, fmt.Errorf("%w: Trim requires WithRetention", ErrInvalidOption)
+	}
+	horizon := q.clock().Add(-q.retention)
+
+	// Messages first — each payload, then its paired lease. Payload-first means
+	// a half-trimmed message is never re-exposed to discovery (which lists
+	// msg/); the crash residue is a lease without a payload, which the residual
+	// lease sweep below removes on a later pass.
+	removed, err := q.trimSweep(ctx, queueMsgPrefix, horizon, DefaultTrimBatch, true)
+	if err != nil || removed >= DefaultTrimBatch {
+		return removed, err
+	}
+	swept, err := q.trimSweep(ctx, queueLeasePrefix, horizon, DefaultTrimBatch-removed, false)
+	return removed + swept, err
+}
+
+// trimSweep deletes entries under prefix whose ids embed a timestamp before
+// horizon, up to budget, returning how many it removed. Time-sortable ids are
+// lexically ordered, so the sweep stops at the first id at or past the horizon;
+// ids in another shape are skipped, never aged out. When pairedLease is set,
+// each removed entry's lease record is deleted alongside it.
+func (q *Queue) trimSweep(ctx context.Context, prefix string, horizon time.Time, budget int, pairedLease bool) (int, error) {
+	removed := 0
+	token := FirstPageToken
+	for budget > 0 {
+		objs, next, err := q.bucket.ListPage(ctx, token, 1000, &ListOptions{Prefix: prefix})
+		if err != nil {
+			return removed, err
+		}
+		for _, obj := range objs {
+			id, ok := strings.CutPrefix(obj.Key, prefix)
+			if !ok || id == "" {
+				continue
+			}
+			ts, ok := queueIDTime(id)
+			if !ok {
+				continue
+			}
+			if !ts.Before(horizon) {
+				return removed, nil
+			}
+			if err := q.bucket.Delete(ctx, obj.Key); err != nil && !errors.Is(err, ErrNotFound) {
+				return removed, err
+			}
+			if pairedLease {
+				if err := q.bucket.Delete(ctx, queueLeasePrefix+id); err != nil && !errors.Is(err, ErrNotFound) {
+					return removed, err
+				}
+			}
+			removed++
+			budget--
+			if budget == 0 {
+				return removed, nil
+			}
+		}
+		if len(next) == 0 {
+			return removed, nil
+		}
+		token = next
+	}
+	return removed, nil
 }
 
 func (q *Queue) writePayload(ctx context.Context, id string, r io.Reader, attrs map[string]string) error {
@@ -565,4 +728,25 @@ func queueJitter(d time.Duration) time.Duration {
 // clock is injected so tests can drive ordering deterministically.
 func newQueueID(now time.Time) string {
 	return fmt.Sprintf("%013d-%s", now.UnixMilli(), uuid.New())
+}
+
+// queueIDTime extracts the enqueue timestamp embedded in a time-sortable queue
+// id ("<13-digit-millis>-<suffix>"). ok is false for a caller-supplied id in
+// another shape, which carries no time and so can be neither age-trimmed nor
+// lag-gated.
+func queueIDTime(id string) (time.Time, bool) {
+	ts, _, found := strings.Cut(id, "-")
+	if !found || len(ts) != 13 {
+		return time.Time{}, false
+	}
+	for i := 0; i < len(ts); i++ {
+		if ts[i] < '0' || ts[i] > '9' {
+			return time.Time{}, false
+		}
+	}
+	ms, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
