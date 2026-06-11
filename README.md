@@ -268,3 +268,15 @@ BLOBSTER_R2_BUCKET=my-bucket BLOBSTER_R2_ENDPOINT=https://<acct>.r2.cloudflarest
 
 See [docs/cloud-tests.md](docs/cloud-tests.md) for credential and permission
 details.
+
+## Running in production
+
+Every blobster utility is a polling loop over blob-storage requests, so
+capacity, latency, and cost come down to poll rates, per-operation request
+counts, and the backend's per-key/per-prefix rate limits.
+[`docs/production.md`](docs/production.md) is the production guide: the
+request-cost model, scalability ceilings and how to tune around them (lock
+contention, queue head-window sizing and sharding, tail/watcher scan costs),
+performance catches, the security model (IAM is the enforcement boundary;
+leases assume synced clocks; no fencing tokens — handlers must be idempotent),
+and a pre-production checklist.
