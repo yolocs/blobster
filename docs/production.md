@@ -89,7 +89,7 @@ never bind — handoff rate is 1/hold-time by definition. The planning number is
 the aggregate heartbeat: held locks × 0.4 req/s, against the write budgets
 above.
 
-### Queue capacity with heavy handlers
+### Queue capacity vs handler time
 
 Assume a 30 s handler. Per message end to end: ~10 writes + ~10 reads + 1 LIST
 (enqueue 1 write; claim ≈ 1 LIST + 3 reads + 1 write; six renews ≈ 6 writes +
@@ -114,13 +114,31 @@ first tuning step for heavy work. The table assumes that's done:
 | Backend bound (if the window weren't binding) | ~350 msg/s per prefix | ~100 msg/s per fresh bucket | ~1,000 msg/s per account |
 | Enqueue-only (broadcast log, no consumers) | ~3,500 msg/s per prefix | ~1,000 msg/s per fresh bucket | account ceiling |
 
-The head-window bound scales inversely with handler time (60 s handlers →
-~15 msg/s per queue on S3) and linearly with sharding — N queue prefixes give
-N× all of the above (on GCS, until the shared bucket budget binds). At a full
-1,000-message window, renew heartbeats alone add ~200 writes/s + 200 reads/s —
-~20 % of a fresh GCS bucket's write budget. One more GCS note for hot broadcast
-logs: time-sortable ids are sequential key names, which work against GCS's
-key-range autoscaling at very high enqueue rates.
+The head-window bound scales inversely with handler time. 60 s handlers halve
+it (~15 msg/s per queue). **Fast ~5 s handlers relax it and flip the
+bottleneck**: a 5 s message sees at most one renew, so it costs only ~5 writes
++ ~5 reads, the default 256 window already sustains ~50 msg/s, and a 1,000
+window ~200 msg/s — at which point the backend binds instead: ~600–700 msg/s
+per S3 prefix, **~200 msg/s per fresh GCS bucket** (the write budget converges
+with the window bound), ~2,000 msg/s per Azure account. At hundreds of
+claims/s, lost claim races inside the fixed 16-key start window also become a
+visible request tax.
+
+**Sharding means running N independent `NewQueue` instances over N disjoint
+prefixes** — producers pick a shard (hash a key for affinity, or round-robin),
+consumers pin to a shard or cycle across them, and ordering, dead-letter, and
+trim are per shard. What sharding buys differs per backend: on **S3** each
+prefix carries its own request budget, so shards multiply real capacity; on
+**GCS** the budget is per *bucket*, so prefix shards only relieve the head
+window — spread shards across buckets (or let sustained load ramp the bucket's
+autoscaling) for backend headroom; on **Azure** the budget is per storage
+account.
+
+At a full 1,000-message window of in-flight work, renew heartbeats alone add
+~200 writes/s + 200 reads/s — ~20 % of a fresh GCS bucket's write budget. One
+more GCS note for hot broadcast logs: time-sortable ids are sequential key
+names, which work against GCS's key-range autoscaling at very high enqueue
+rates.
 
 ### SDK configuration
 
@@ -168,10 +186,12 @@ The queue's ceilings, in the order you will hit them:
    first 16 listed keys (a fixed constant). Beyond a few dozen workers per
    queue prefix, lost claim races (each a billed failed write) grow steadily.
 3. **The single-prefix request ceiling.** All of a queue's traffic lands under
-   one prefix. Before you reach the backend's per-prefix limit, **shard by
-   composition**: run N queues over N prefixes and spread producers/consumers
-   across them — that is the designed scaling path, there is no in-library
-   sharding.
+   one prefix. Before you reach the backend's limit, **shard by composition**:
+   run N independent queues over N disjoint prefixes and spread
+   producers/consumers across them — that is the designed scaling path, there
+   is no in-library sharding. See the capacity section above for what a shard
+   actually buys per backend (a real budget on S3; only head-window relief on
+   GCS, where the budget is per bucket).
 4. **Idle polling cost** — see the worked example above. The floor is
    `WithQueueReceiveBackoff`'s cap; raising it trades delivery latency for
    standing cost.
