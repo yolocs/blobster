@@ -111,6 +111,39 @@ shipped surface.
     lets a caller build its own policy. **Follow-up — `WithDeadLetterQueue`:**
     redirect dead letters into a separate queue instead of the in-prefix `dead/`;
     deferred and additive.
+  - **Dedup-keyed enqueue — built and shipped.** `EnqueueWithID` writes a
+    message under a caller-supplied id, create-only, reporting `existed=true`
+    as a no-op instead of double-delivering — the idempotent-producer primitive
+    and the replication watcher's dedup key. The acked-and-gone limitation
+    (an acked id is free to re-create) is documented, not tombstoned.
+  - **Retention / TTL trim — built and shipped.** `WithRetention(d)` plus an
+    explicit, bounded, caller-scheduled `Trim` pass range-deletes messages (and
+    their lease records) older than the horizon by id-embedded time — the
+    janitor that keeps a broadcast log from growing forever, and the concrete
+    form of the old "lifecycle / retention helpers" idea for the queue.
+    **Future — watermark-based horizon:** trim only up to the minimum follower
+    cursor when a back-channel exists; additive.
+  - **Read-only tail — built and shipped.** `Queue.Tail()` iterates the message
+    log forward from a caller-persisted cursor without leasing or acking, with
+    a configurable cursor lag (`WithTailLag`) that keeps a late-committed
+    payload from being skipped. **Future — `StartAfter` listing option:** S3
+    and GCS support native start-after listing; plumbing it through
+    `ListOptions` would turn the tail's head-scan into a seek; additive.
+
+### Fan-out replication
+- **Watcher — built and shipped.** `blobster.NewWatcher(sourceTail, localQueue,
+  locker, …)` bridges a read-only source queue (the leader region's broadcast
+  log) into a local queue, so existing workers consume replicated messages
+  normally: one leader enqueues each change once — leader write cost O(1) in
+  the follower count — and each follower's singleton watcher (HA via the lease
+  lock) tails the log from a durable, CAS-guarded cursor in its own bucket and
+  re-enqueues under the leader's id (idempotent across crash, restart, and
+  zombie-holder overlap). Composes the dedup-keyed enqueue, retention trim, and
+  read-only tail above; see the "Fan-out replication" section of
+  `architecture.md`.
+- **Follow-up — reconciliation sweep.** Periodically diff the source log
+  against locally-enqueued ids to catch anything the fast path dropped, and let
+  a follower that fell past the leader's retention horizon re-bootstrap.
 
 ### Cross-cutting
 - Signed/presigned URL hardening. `SignedURL` is already a base `Bucket`
@@ -126,7 +159,8 @@ shipped surface.
 - **Content addressing / dedup helpers** — write-by-digest and integrity
   verification on the streamed path.
 - **Lifecycle / retention helpers** — TTL and cleanup conventions expressed over
-  the keyspace.
+  the keyspace beyond the queue (the queue's own retention shipped as
+  `WithRetention`/`Trim`).
 
 ## Explicitly out of scope (for now)
 - A domain model (packages, datasets, etc.) — that belongs to callers.

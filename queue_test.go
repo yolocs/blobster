@@ -1299,6 +1299,369 @@ func TestQueueDeadLetterResumesAfterPartialMove(t *testing.T) {
 	}
 }
 
+// TestQueueEnqueueWithIDIdempotent verifies the dedup contract: the first
+// enqueue under an id writes, a second enqueue under the same id is a no-op
+// success reporting existed=true, and exactly one message (with the first
+// writer's body and attributes) is delivered.
+func TestQueueEnqueueWithIDIdempotent(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
+
+		existed, err := q.EnqueueWithID(ctx, "evt-1", strings.NewReader("first"), &blobster.EnqueueOptions{
+			Attributes: map[string]string{"kind": "event"},
+		})
+		if err != nil {
+			t.Fatalf("first EnqueueWithID: %v", err)
+		}
+		if existed {
+			t.Fatal("first EnqueueWithID reported existed=true")
+		}
+		existed, err = q.EnqueueWithID(ctx, "evt-1", strings.NewReader("second"), nil)
+		if err != nil {
+			t.Fatalf("second EnqueueWithID: %v", err)
+		}
+		if !existed {
+			t.Fatal("second EnqueueWithID reported existed=false; duplicate written")
+		}
+
+		// A supplied-id message receives and acks like any other, with the first
+		// writer's payload intact.
+		msg, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("TryReceive: %v", err)
+		}
+		if msg.ID() != "evt-1" {
+			t.Errorf("ID = %q, want evt-1", msg.ID())
+		}
+		if got := msg.Attributes()["kind"]; got != "event" {
+			t.Errorf("Attributes[kind] = %q, want event", got)
+		}
+		body, err := msg.ReadAll(ctx)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if string(body) != "first" {
+			t.Errorf("body = %q, want first (second writer must not overwrite)", body)
+		}
+		if err := msg.Ack(ctx); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("queue not drained: %v", err)
+		}
+	})
+}
+
+func TestQueueEnqueueWithIDValidation(t *testing.T) {
+	t.Parallel()
+	q := mustNewQueue(t, mem.New(), "jobs/")
+	for _, id := range []string{"", "a/b", "/abs", "..", "a..b", "."} {
+		if _, err := q.EnqueueWithID(t.Context(), id, strings.NewReader("x"), nil); !errors.Is(err, blobster.ErrInvalidMessageID) {
+			t.Errorf("EnqueueWithID(%q): got %v, want ErrInvalidMessageID", id, err)
+		}
+	}
+}
+
+// TestQueueEnqueueWithIDConcurrentSingleWriter races many producers on one id:
+// exactly one observes existed=false, and exactly one message exists.
+func TestQueueEnqueueWithIDConcurrentSingleWriter(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
+
+		const contenders = 8
+		var (
+			wg      sync.WaitGroup
+			writers atomic.Int64
+			start   = make(chan struct{})
+		)
+		for i := range contenders {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				existed, err := q.EnqueueWithID(ctx, "shared", strings.NewReader(fmt.Sprintf("body-%d", i)), nil)
+				if err != nil {
+					t.Errorf("EnqueueWithID: %v", err)
+					return
+				}
+				if !existed {
+					writers.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if got := writers.Load(); got != 1 {
+			t.Fatalf("writers = %d, want exactly 1", got)
+		}
+
+		msg, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("TryReceive: %v", err)
+		}
+		if err := msg.Ack(ctx); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+		if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+			t.Fatalf("more than one message written: %v", err)
+		}
+	})
+}
+
+// TestQueueEnqueueWithIDAfterAckRecreates pins the documented acked-and-gone
+// limitation: create-only protects only against a currently existing payload,
+// so once the message is acked away its id is free and a late re-enqueue
+// re-creates it.
+func TestQueueEnqueueWithIDAfterAckRecreates(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		q := mustNewQueue(t, bucket, "jobs/", blobster.WithQueueRenewInterval(time.Hour))
+
+		if _, err := q.EnqueueWithID(ctx, "evt-1", strings.NewReader("once"), nil); err != nil {
+			t.Fatalf("EnqueueWithID: %v", err)
+		}
+		msg, err := q.TryReceive(ctx)
+		if err != nil {
+			t.Fatalf("TryReceive: %v", err)
+		}
+		if err := msg.Ack(ctx); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+
+		existed, err := q.EnqueueWithID(ctx, "evt-1", strings.NewReader("again"), nil)
+		if err != nil {
+			t.Fatalf("re-enqueue after ack: %v", err)
+		}
+		if existed {
+			t.Fatal("existed=true after ack; the acked id should be free again")
+		}
+	})
+}
+
+// TestQueueTrimRemovesOnlyOverHorizon verifies the retention range-delete: an
+// over-horizon message goes (payload and lease), a within-horizon message and
+// its lease stay untouched.
+func TestQueueTrimRemovesOnlyOverHorizon(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithQueueRenewInterval(time.Hour),
+			blobster.WithRetention(time.Hour),
+		)
+
+		oldID := enqueueString(t, q, "stale", nil)
+		// Give the old message a lease record so the paired cleanup is exercised.
+		if err := bucket.WriteAll(ctx, "jobs/lease/"+oldID, nil, &blobster.WriterOptions{
+			Metadata:                    map[string]string{"owner": "ghost"},
+			DisableContentTypeDetection: true,
+		}); err != nil {
+			t.Fatalf("seed old lease: %v", err)
+		}
+
+		clock.Advance(2 * time.Hour)
+		newID := enqueueString(t, q, "fresh", nil)
+		if err := bucket.WriteAll(ctx, "jobs/lease/"+newID, nil, &blobster.WriterOptions{
+			Metadata:                    map[string]string{"owner": "live"},
+			DisableContentTypeDetection: true,
+		}); err != nil {
+			t.Fatalf("seed fresh lease: %v", err)
+		}
+
+		n, err := q.Trim(ctx)
+		if err != nil {
+			t.Fatalf("Trim: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("Trim removed %d, want 1", n)
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/msg/"+oldID); ok {
+			t.Error("over-horizon payload survived Trim")
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/lease/"+oldID); ok {
+			t.Error("over-horizon lease survived Trim")
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/msg/"+newID); !ok {
+			t.Error("within-horizon payload trimmed")
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/lease/"+newID); !ok {
+			t.Error("within-horizon lease trimmed")
+		}
+	})
+}
+
+// TestQueueTrimSweepsOrphanLeases verifies the residual sweep: a lease record
+// older than the horizon whose payload is already gone (crash residue) is
+// removed and counted.
+func TestQueueTrimSweepsOrphanLeases(t *testing.T) {
+	t.Parallel()
+	eachBucket(t, func(t *testing.T, bucket blobster.Bucket) {
+		ctx := t.Context()
+		clock := newManualClock()
+		q := mustNewQueue(t, bucket, "jobs/",
+			blobster.WithQueueClock(clock.Now),
+			blobster.WithRetention(time.Hour),
+		)
+
+		orphanID := fmt.Sprintf("%013d-orphan", clock.Now().UnixMilli())
+		if err := bucket.WriteAll(ctx, "jobs/lease/"+orphanID, nil, &blobster.WriterOptions{
+			Metadata:                    map[string]string{"owner": "ghost"},
+			DisableContentTypeDetection: true,
+		}); err != nil {
+			t.Fatalf("seed orphan lease: %v", err)
+		}
+
+		clock.Advance(2 * time.Hour)
+		n, err := q.Trim(ctx)
+		if err != nil {
+			t.Fatalf("Trim: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("Trim removed %d, want 1 (the orphan lease)", n)
+		}
+		if ok, _ := bucket.Exists(ctx, "jobs/lease/"+orphanID); ok {
+			t.Error("orphan lease survived Trim")
+		}
+	})
+}
+
+func TestQueueTrimRequiresRetention(t *testing.T) {
+	t.Parallel()
+	q := mustNewQueue(t, mem.New(), "jobs/")
+	if _, err := q.Trim(t.Context()); !errors.Is(err, blobster.ErrInvalidOption) {
+		t.Fatalf("Trim without WithRetention: got %v, want ErrInvalidOption", err)
+	}
+}
+
+// TestQueueTrimSkipsUnsortableIDs verifies a caller-supplied id outside the
+// time-sortable shape carries no timestamp and is never aged out.
+func TestQueueTrimSkipsUnsortableIDs(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	clock := newManualClock()
+	q := mustNewQueue(t, mem.New(), "jobs/",
+		blobster.WithQueueClock(clock.Now),
+		blobster.WithRetention(time.Hour),
+	)
+	if _, err := q.EnqueueWithID(ctx, "pinned", strings.NewReader("keep"), nil); err != nil {
+		t.Fatalf("EnqueueWithID: %v", err)
+	}
+	oldID := enqueueString(t, q, "stale", nil)
+
+	clock.Advance(2 * time.Hour)
+	n, err := q.Trim(ctx)
+	if err != nil {
+		t.Fatalf("Trim: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Trim removed %d, want 1", n)
+	}
+	msg, err := q.TryReceive(ctx)
+	if err != nil {
+		t.Fatalf("TryReceive: %v (the unsortable-id message should survive)", err)
+	}
+	if msg.ID() != "pinned" {
+		t.Fatalf("received %q, want pinned (trimmed message %q resurfaced?)", msg.ID(), oldID)
+	}
+	if err := msg.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+}
+
+// TestQueueTrimBoundedBatch verifies one pass removes at most DefaultTrimBatch
+// entries and later passes finish the backlog.
+func TestQueueTrimBoundedBatch(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	clock := newManualClock()
+	q := mustNewQueue(t, mem.New(), "jobs/",
+		blobster.WithQueueClock(clock.Now),
+		blobster.WithRetention(time.Hour),
+	)
+	const backlog = blobster.DefaultTrimBatch + 4
+	for range backlog {
+		enqueueString(t, q, "stale", nil)
+	}
+	clock.Advance(2 * time.Hour)
+
+	n1, err := q.Trim(ctx)
+	if err != nil {
+		t.Fatalf("first Trim: %v", err)
+	}
+	if n1 != blobster.DefaultTrimBatch {
+		t.Fatalf("first Trim removed %d, want %d", n1, blobster.DefaultTrimBatch)
+	}
+	n2, err := q.Trim(ctx)
+	if err != nil {
+		t.Fatalf("second Trim: %v", err)
+	}
+	if n2 != 4 {
+		t.Fatalf("second Trim removed %d, want 4", n2)
+	}
+	n3, err := q.Trim(ctx)
+	if err != nil {
+		t.Fatalf("third Trim: %v", err)
+	}
+	if n3 != 0 {
+		t.Fatalf("third Trim removed %d, want 0", n3)
+	}
+}
+
+// TestQueueTrimConcurrentJanitors verifies concurrent passes are safe: no
+// errors, and the over-horizon backlog is fully removed while recent messages
+// survive. (Counts may overlap between racers; only the end state is asserted.)
+func TestQueueTrimConcurrentJanitors(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	clock := newManualClock()
+	q := mustNewQueue(t, mem.New(), "jobs/",
+		blobster.WithQueueClock(clock.Now),
+		blobster.WithRetention(time.Hour),
+	)
+	const stale = 50
+	for range stale {
+		enqueueString(t, q, "stale", nil)
+	}
+	clock.Advance(2 * time.Hour)
+	freshID := enqueueString(t, q, "fresh", nil)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := q.Trim(ctx); err != nil {
+				t.Errorf("concurrent Trim: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	msg, err := q.TryReceive(ctx)
+	if err != nil {
+		t.Fatalf("TryReceive after trim: %v", err)
+	}
+	if msg.ID() != freshID {
+		t.Fatalf("received %q, want only the fresh message %q", msg.ID(), freshID)
+	}
+	if err := msg.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if _, err := q.TryReceive(ctx); !errors.Is(err, blobster.ErrNoMessages) {
+		t.Fatalf("stale messages survived concurrent trims: %v", err)
+	}
+}
+
 // TestQueueMalformedLeaseRecordRecoverable verifies a lease record written out of
 // band with no deadline and a garbage receives count is treated as expired and
 // taken over, with a sane receives count — mirroring the lock's malformed-record

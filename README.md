@@ -45,7 +45,11 @@ Implemented:
 - cross-region copy as an optional driver capability (`s3`, `gcs`, `azureblob`)
 - blob-backed work queue (`blobster.NewQueue`) — competing consumers,
   at-least-once delivery, approximate FIFO, built on the conditional-write
-  primitive
+  primitive; with dedup-keyed enqueue (`EnqueueWithID`), retention trim
+  (`WithRetention`/`Trim`), and a read-only tail view (`Queue.Tail`)
+- fan-out replication watcher (`blobster.NewWatcher`) — bridges a read-only
+  source queue (a leader's broadcast log) into a local queue, singleton per
+  region via the lease lock, resuming from a durable cursor
 
 Planned:
 
@@ -179,6 +183,34 @@ if err := handleJob(ctx, body); err != nil {
 	return err
 }
 return msg.Ack(ctx) // processed; remove it
+```
+
+`EnqueueWithID` enqueues create-only under a caller-supplied id, so a retried
+producer is an idempotent no-op (`existed=true`) instead of a duplicate.
+`WithRetention(d)` plus an explicit `Trim` call range-deletes messages older
+than the horizon — the janitor for a queue used as a broadcast log that nobody
+acks empty.
+
+### Fan-out replication
+
+A queue can also be *tailed* read-only (`q.Tail()`) — iterated forward from a
+cursor without leasing or acking. `blobster.NewWatcher` builds on that to
+replicate a leader region's queue into a follower's: the leader enqueues each
+message once, and each follower's watcher (a singleton elected via the lease
+lock, resuming from a durable cursor in the follower's own bucket) re-enqueues
+it locally under the leader's id, so local workers consume it normally and
+replays dedup. See the "Fan-out replication" section of
+[`docs/architecture.md`](docs/architecture.md).
+
+```go
+leaderTail := leaderQueue.Tail() // leaderQueue may be over a read-only bucket
+w, err := blobster.NewWatcher(leaderTail, localQueue, blobster.NewLocker(followerBucket),
+	blobster.WithWatchName("leader-events"),
+)
+if err != nil {
+	return err
+}
+return w.Run(ctx) // contend, replicate, and stand by again until ctx is done
 ```
 
 ### Cross-region copy

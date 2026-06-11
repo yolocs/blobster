@@ -803,9 +803,10 @@ construction error; the lock validates its key per-acquire instead, but the
 queue's prefix is fixed at construction, so it is validated there).
 
 **Errors.** The queue reuses `ErrNotFound`/`ErrPreconditionFailed` internally to
-interpret conditional ops (like the lock) and adds three of its own:
+interpret conditional ops (like the lock) and adds four of its own:
 `ErrNoMessages` (`TryReceive` on an empty queue), `ErrMessageLost` (the held
-lease was lost), and `ErrInvalidQueuePrefix`.
+lease was lost), `ErrInvalidQueuePrefix`, and `ErrInvalidMessageID`
+(`EnqueueWithID` given an empty or escaping id).
 
 **Documented limitations.** Single-prefix request-rate ceiling (shard via
 multiple queues); idle polling cost (there is no push/long-poll on blob storage);
@@ -823,6 +824,189 @@ delete window can leave one empty-bodied orphan lease (harmless, never
 resurrects the message); redirecting dead letters to a *separate* queue is
 deferred.
 
+### Dedup-keyed enqueue (`EnqueueWithID`)
+
+`Enqueue` mints a fresh time-sortable id per call, so a producer that retries —
+or two producers racing on the same logical event — writes distinct messages
+and double-delivers. `EnqueueWithID` closes that hole: it writes the payload
+under a **caller-supplied id, create-only** (the same `IfNotExists` write
+`Enqueue` already uses), and when a payload with that id already exists it
+reports `existed=true` as a no-op success instead of surfacing the precondition
+failure. Re-enqueuing the same logical message is therefore idempotent — the
+exactly-once-ish enqueue an at-least-once producer needs, and the load-bearing
+primitive for the replication watcher's non-atomic "enqueue, then advance
+cursor" step (see [Fan-out replication](#fan-out-replication-the-queue-watcher)).
+
+Two documented consequences of supplying ids:
+
+- **The caller owns ordering.** Approximate-FIFO discovery relies on
+  time-sortable ids; a supplied id outside the `<13-digit-millis>-<suffix>`
+  shape lands at its arbitrary lexical position, carries no timestamp, and is
+  therefore never trimmed by retention and never lag-gated by the tail. (The
+  watcher supplies the *leader's* time-sortable id, so replicated order is
+  preserved.)
+- **"Acked and gone" is not tombstoned.** Create-only protects only against a
+  currently existing payload: once a message is acked (or trimmed) its id is
+  free again, and a late re-enqueue re-creates it. There is deliberately no
+  persisted seen-set — that role belongs to the caller (for the watcher, its
+  forward-only cursor, which never rewinds past replicated history).
+
+The id must be a non-empty single path segment (no `/`, no `..`, not `.`);
+otherwise `ErrInvalidMessageID`.
+
+### Retention / `Trim` — the broadcast-log janitor
+
+`WithRetention(d)` plus `Trim` is the opt-in lifecycle policy: one `Trim` call
+makes a single bounded pass that **range-deletes messages older than the
+horizon** (now − d) — payload and paired lease — plus residual over-horizon
+lease records whose messages are already gone (crash residue from partial acks,
+dead-letter moves, or earlier trims). It exists because a **broadcast log has
+no consumer to ack it empty** — followers tail the leader's queue read-only, so
+without a janitor the log grows forever — and it doubles as cleanup for
+abandoned messages on ordinary queues.
+
+Mechanics, all riding existing invariants:
+
+- **The id carries the time, so the horizon is a lexical key range.** Ids embed
+  a 13-digit epoch-millisecond prefix; "older than the horizon" is a forward
+  scan of `msg/` that stops at the first id at or past the cutoff. No
+  per-object attribute reads, no lease-ack — this is a janitor over the
+  keyspace, not a consumer.
+- **Bounded and caller-scheduled.** Each pass removes at most `DefaultTrimBatch`
+  entries; the owner calls `Trim` on its own schedule (explicit `Trim` was
+  chosen over a managed background janitor — simplest and most testable; a
+  managed runner stays an additive follow-up). Concurrent passes are safe
+  (deletes are idempotent, counts may overlap); a single-mover can be composed
+  by gating `Trim` behind the lease lock.
+- **Payload-first per message.** Deleting the payload before its lease means a
+  half-trimmed message is never re-exposed to discovery (which lists `msg/`);
+  the crash residue is a lease without a payload, removed by the residual sweep
+  of a later pass.
+- **The horizon is a hard policy, not a liveness check.** A message older than
+  the horizon is removed even if a worker currently holds its lease (the worker
+  observes `ErrMessageLost`), so the retention must comfortably exceed
+  worst-case queue dwell plus processing time — and, for a replicated log,
+  worst-case follower lag plus downtime, or a lagging follower's cursor falls
+  off the log and it must re-bootstrap via a reconciliation sweep (the
+  documented floor). A watermark-based horizon (trim only up to the minimum
+  follower cursor) is a possible future addition when a back-channel exists.
+
+### `Tail` — the read-only log view
+
+`Queue.Tail()` returns a **read-only, forward view over the message log**: it
+surfaces messages whose ids sort after a caller-supplied cursor, in id order,
+without taking a lease, acking, or writing anything. This is the queue's second
+consumption mode: where `Receive` is a **competing consumer** (claims a lease,
+hides the message from others, acks it away), a tailer is a **broadcast
+reader** — every tailer sees every message, and the source bucket can be one
+the tailer can only read. The asymmetry is exactly what fan-out replication
+needs: followers can read the leader's bucket but cannot write lease or ack
+records into it.
+
+- **The cursor is the caller's.** `Page(ctx, cursor, n)` returns up to `n`
+  messages with ids after `cursor` plus the id to resume from; the caller
+  persists it durably (the watcher stores it in its own bucket). `Tail` itself
+  is stateless.
+- **Cursor lag closes the late-commit hole.** A message id is stamped at
+  enqueue, but its payload commits when the streamed write finishes — so a
+  fast-committing newer message could pull the cursor past a slower,
+  earlier-stamped one still in flight. The tail therefore surfaces only
+  messages stamped at or before now − lag (`WithTailLag`, default
+  `DefaultTailLag`): by the time the cursor can pass an id, anything stamped
+  earlier has had the whole lag window to commit. The window must exceed
+  worst-case payload write latency plus producer clock skew; the gate relies on
+  time-sortable ids (a caller-shaped id surfaces as soon as it is listed, with
+  no lag protection).
+- **`TailMessage` is `Message` minus the lease**: id, lazily read attributes,
+  and the streamed payload — no Ack/Nack, no renewer, no lost signal. Reads hit
+  the immutable payload directly and report `ErrNotFound` once it is acked or
+  trimmed away.
+- **Cost tracks the retained log.** `Page` scans the `msg/` keyspace from its
+  head each call (the base `ListPage` has no start-after, and a page token is
+  not synthesizable portably), skipping keys at or before the cursor, so the
+  scan is bounded by the log's retained length — pair the tailed queue with
+  retention so both the log and the scan stay bounded. A `StartAfter` listing
+  option (natively supported by S3 and GCS) is a possible future optimization;
+  it would be additive.
+
+The leader side stays a full `Queue` rather than a lighter publish-only `Log`
+type: enqueue-only use *is* the publish mode (nothing forces a publisher to
+call `Receive`), and a second type would duplicate the construction surface for
+no new capability.
+
+## Fan-out replication (the queue watcher)
+
+The **watcher** composes the three queue extensions above into the fan-out
+replication bridge: one leader region enqueues each change **once** into its
+queue (used as a broadcast log — `Enqueue` only, nobody acks it); every
+follower region runs a `Watcher` that **tails the leader's log read-only and
+re-enqueues each message into a local queue**, where existing workers consume
+it normally. The leader's write cost is **O(1) in the number of followers** —
+the alternative (the leader enqueuing into one queue per follower)
+write-amplifies the leader by the follower count — and each region's fan-in
+happens locally, off the leader's critical path. The same `Queue` type serves
+both modes: publish/broadcast on the leader (followers cannot write its bucket,
+so it has no competing consumers) and ordinary competing-consumers on each
+follower.
+
+The watcher lives in the **root package** beside the lock and the queue — it
+depends only on the root contract plus `Queue`, `Tail`, and `Locker`, and
+carries no cloud-specific logic. Construction is
+`blobster.NewWatcher(sourceTail, localQueue, locker, …)`; `Run(ctx)` is the
+whole lifecycle (acquire, resume, replicate until ctx is done — `Start`/`Stop`
+would only wrap the same loop in state).
+
+```
+leader bucket                       follower bucket
+  events/msg/<id>   ──tail──▶  Watcher ──EnqueueWithID(id)──▶ events/msg/<id>
+  (broadcast log,              (singleton                      (local queue,
+   Trim'd by owner)             via lease lock)                 competing workers)
+                                   │
+                                   └─ cursor CAS'd at .blobster/watch/<name>/cursor
+```
+
+- **Singleton per watch name, HA via the lease lock.** Every instance calls
+  `Run`; exactly one holds the lock (`watch/<name>` under the caller's locker)
+  and replicates while the rest stand by blocked on acquisition. When the
+  holder dies, its lease expires and a standby takes over, resuming from the
+  durable cursor — no gap, because the cursor is persisted only after the
+  messages it covers are enqueued locally.
+- **The cursor lives with the election.** It is stored in the **locker's
+  bucket** (the follower's own, writable bucket) at
+  `.blobster/watch/<name>/cursor`, deliberately: the election and the cursor
+  must travel together for a takeover to resume exactly where the holder
+  stopped, and the state is reconstructible from the bucket (invariant 1).
+- **The cursor is CAS-guarded, so a paused zombie can never rewind a
+  successor.** The holder persists the cursor with `IfMatch` on the version it
+  last wrote (create-only the first time). A stale holder that resumes after a
+  takeover trips the precondition on its first persist and stands down —
+  returning to contention — and the messages it replayed meanwhile were
+  create-only no-ops. This is the same "the protected object's own conditional
+  write orders writers" pattern the lock documents in lieu of fencing tokens.
+- **"Enqueue, then advance cursor" is non-atomic but idempotent.** A crash (or
+  takeover) between the two replays the page on resume; `EnqueueWithID` under
+  the **leader's message id** makes each replay a no-op while the message still
+  exists locally. The residual window — a replicated message that local workers
+  already acked being re-created by a replay — requires the cursor to move
+  backward, which the watcher never does; only a manual rewind reopens it
+  (at-least-once is the end-to-end contract regardless).
+- **Payloads flow through the watcher, provider-agnostically.** Replication is
+  a plain cross-bucket streamed read + create-only write — no
+  `CrossRegionCopier` dependency — so it works `mem`→`mem` in tests and, e.g.,
+  `s3`→`gcs` in production. A source message that vanishes between listing and
+  copying (acked or trimmed away) is skipped.
+- **Pair the leader with retention; the reconciliation sweep is the longstop.**
+  The leader's owner runs `Trim` (the broadcast log has no acks), with the
+  horizon floored by worst-case follower lag + downtime. A periodic
+  reconciliation sweep — diffing the source log against locally-enqueued ids to
+  catch anything the fast path dropped, and re-bootstrapping a follower that
+  fell past the leader's retention horizon — is a deliberate follow-up, not
+  part of this cut.
+
+The watcher adds `ErrInvalidWatchName` (the name keys both the lock and the
+cursor, so it must be a single non-escaping path segment) and reuses the root
+sentinels everywhere else.
+
 ## Code layout
 
 The repository stays flat: the user-facing interfaces and shared types live in
@@ -837,7 +1021,10 @@ blobster/            ← root package: Bucket + optional capability interfaces,
                        Attributes, Precondition/conditions, errors, Capabilities,
                        the lease lock (Locker, Lock, NewLocker over a Bucket), the
                        blob-backed work queue (Queue, Message, NewQueue over a
-                       Bucket), and the cross-region copy handle (CopyOperation,
+                       Bucket) with its read-only tail view (Tail, TailMessage)
+                       and retention janitor (WithRetention, Trim), the fan-out
+                       replication watcher (Watcher, NewWatcher), and the
+                       cross-region copy handle (CopyOperation,
                        StartCopyOperation) backing the CrossRegionCopier capability
 blobtest/            ← shared conformance suite for Bucket implementations
 mem/                 ← in-memory driver (reference implementation + test substrate)
@@ -867,8 +1054,9 @@ interfaces.
 ```
 
 - Drivers import **only** the root `blobster` package (and their native SDK).
-- The lease lock and the work queue live in the root package; each depends only
-  on the root contract (no driver imports), so surfacing them at the top level
+- The lease lock, the work queue (with its tail view and retention janitor),
+  and the replication watcher live in the root package; each depends only on
+  the root contract (no driver imports), so surfacing them at the top level
   keeps the dependency graph one-directional.
 - The planned `multipart` utility package will depend on the root **interfaces**,
   never on a concrete driver — so it works against any backend that advertises
@@ -885,6 +1073,7 @@ blobster's own objects live under a reserved sub-prefix by convention:
 ```
 <root>/<caller keys…>
 <root>/.blobster/locks/<name>          ← lock records
+<root>/.blobster/watch/<name>/cursor   ← replication watcher cursors
 <root>/.blobster/multipart/<id>/…      ← planned in-flight multipart bookkeeping (where emulated)
 ```
 
@@ -912,8 +1101,8 @@ renewed), and `ErrInvalidLockKey`; internally it reuses `ErrNotFound` and
 `ErrPreconditionFailed` to interpret the bucket's conditional ops rather than
 introducing parallel sentinels. The work queue (also in the root package)
 follows the same convention: it reuses `ErrNotFound`/`ErrPreconditionFailed`
-internally and adds `ErrNoMessages`, `ErrMessageLost`, and
-`ErrInvalidQueuePrefix`.
+internally and adds `ErrNoMessages`, `ErrMessageLost`, `ErrInvalidQueuePrefix`,
+and `ErrInvalidMessageID`. The replication watcher adds `ErrInvalidWatchName`.
 
 ## Non-goals / deferred
 
