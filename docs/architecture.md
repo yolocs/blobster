@@ -5,7 +5,9 @@ invariants that hold them together. This is a **living document** — keep it
 current as the design evolves, and update it in the same change as the behavior
 it describes. For how we work on the project see [`../AGENTS.md`](../AGENTS.md);
 for the planning backlog see [`roadmap.md`](roadmap.md); committed work lives in
-GitHub issues.
+GitHub issues. For operating blobster in production — request costs, scalability
+ceilings, tuning, and the security model's sharp edges — see
+[`production.md`](production.md).
 
 This describes both the implemented v0.1 initial release surface and the **target**
 architecture. The base `Bucket` API, shared conformance tests, and the `mem`,
@@ -1034,6 +1036,7 @@ gcs/                 ← Google Cloud Storage driver (wraps *storage.Client)
 azureblob/           ← Azure Blob driver (wraps the container client)
 docs/
   architecture.md    ← this document
+  production.md      ← production guide: costs, scalability, tuning, security
   roadmap.md         ← planning backlog
   cloud-backend-research.md  ← verified backend API facts behind the design
 AGENTS.md            ← how we work  (CLAUDE.md is a symlink to it)
