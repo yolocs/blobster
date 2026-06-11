@@ -51,21 +51,78 @@ polling is the dominant standing cost of the queue and the watcher; tune
 `WithQueueReceiveBackoff` / `WithWatchPollBackoff` caps to what your latency
 target actually needs.
 
-## Backend rate limits (the hard ceilings)
+## Backend rate limits and rough capacity
 
-These are the limits the defaults are designed around; they bound how far any
-tuning can go:
+The published quotas the defaults are designed around (your account/bucket may
+differ; treat everything in this section as order-of-magnitude ceilings to plan
+against, not benchmarks, and leave yourself ~2× headroom):
 
-- **GCS throttles writes to ~1/sec per object name.** Every lock record, queue
-  lease record, and watcher cursor is a single hot object. This is why all
-  lease timing is second-scale: do not set a lock/queue renew interval below
-  ~2 s or a lease below ~5 s anywhere you might run on GCS, and do not build
-  anything that CAS-spins on one key.
-- **S3 scales per prefix**: roughly 3,500 writes and 5,500 reads per second per
-  partitioned prefix — and partitioning ramps up gradually, so a brand-new
-  prefix hit with a burst may throttle (503 `SlowDown`) before S3 splits it.
-- **Azure** limits are account- and partition-scoped (default ~20 k requests/s
-  per account); a single hot blob is also subject to per-blob throughput caps.
+| Raw blob ops | S3 | GCS | Azure |
+|---|---|---|---|
+| Writes (distinct keys) | ~3,500/s per prefix (shard prefixes for more) | ~1,000/s per bucket initially, autoscales under sustained load | ~20,000/s per account |
+| Reads (distinct keys) | ~5,500/s per prefix | ~5,000/s per bucket initially | ~20,000/s per account |
+| Writes to **one** key | no fixed cap; concurrent CAS races 409 | **~1/s sustained** | ~500 req/s per blob |
+| Reads of one key | within prefix read budget | scales | ~500 req/s per blob |
+
+GCS's 1 write/s per object name is the limit that shapes the library: every
+lock record, lease record, and watcher cursor is a single hot object, which is
+why all lease timing is second-scale. Do not set a renew interval below ~2 s or
+a lease below ~5 s anywhere you might run on GCS, and do not build anything
+that CAS-spins on one key. On S3, prefix partitioning ramps up gradually — a
+brand-new prefix hit with a burst may throttle (503 `SlowDown`) before S3
+splits it.
+
+### Lock capacity
+
+At the defaults (15 s lease, renew every 5 s), each held lock costs 0.2 writes/s
++ 0.2 reads/s of heartbeat; each standby contender costs ~0.67 reads/s of
+polling. That gives, per backend:
+
+| Lock | S3 | GCS | Azure |
+|---|---|---|---|
+| Concurrently held locks | ~15,000 per prefix (write-bound) | ~5,000 per fresh bucket | ~50,000 per account |
+| Handoff rate on one lock | contention-bound, ~tens/s | **~0.5/s** (2 writes per handoff on one object) | ~100/s theoretical (per-blob cap) |
+| Standby contenders on one lock | shares the prefix read budget (~8,000) | effectively unbounded | ~700 (per-blob 500 req/s) |
+
+With heavy work (hold times of dozens of seconds), the per-lock handoff limits
+never bind — handoff rate is 1/hold-time by definition. The planning number is
+the aggregate heartbeat: held locks × 0.4 req/s, against the write budgets
+above.
+
+### Queue capacity with heavy handlers
+
+Assume a 30 s handler. Per message end to end: ~10 writes + ~10 reads + 1 LIST
+(enqueue 1 write; claim ≈ 1 LIST + 3 reads + 1 write; six renews ≈ 6 writes +
+6 reads; ack ≈ 1 read + 2 deletes — S3 adds ~3 extra HEADs). Per-message lease
+traffic stays safely under GCS's 1 write/s per object as long as renew ≥ 2 s.
+
+**For heavy work, the head window — not the cloud — is the throughput
+ceiling.** In-flight messages = rate × processing time (Little's law), leased
+payloads stay listed, and available messages beyond the window are invisible —
+so one queue sustains at most (effective head window ÷ processing time). S3
+caps a list page at 1,000 keys (a larger `WithQueueHeadWindow` is silently
+truncated) and Azure at 5,000; GCS pages internally past 1,000 at extra LIST
+cost per receive.
+
+At the **default** window of 256, a 30 s handler caps every queue at ~8 msg/s
+on every backend — raising `WithQueueHeadWindow` toward the backend cap is the
+first tuning step for heavy work. The table assumes that's done:
+
+| Queue, 30 s handlers | S3 | GCS | Azure |
+|---|---|---|---|
+| Head-window bound (per queue) | **~30 msg/s** | ~30 msg/s (more with a >1,000 window, at extra LIST cost) | ~160 msg/s |
+| Backend bound (if the window weren't binding) | ~350 msg/s per prefix | ~100 msg/s per fresh bucket | ~1,000 msg/s per account |
+| Enqueue-only (broadcast log, no consumers) | ~3,500 msg/s per prefix | ~1,000 msg/s per fresh bucket | account ceiling |
+
+The head-window bound scales inversely with handler time (60 s handlers →
+~15 msg/s per queue on S3) and linearly with sharding — N queue prefixes give
+N× all of the above (on GCS, until the shared bucket budget binds). At a full
+1,000-message window, renew heartbeats alone add ~200 writes/s + 200 reads/s —
+~20 % of a fresh GCS bucket's write budget. One more GCS note for hot broadcast
+logs: time-sortable ids are sequential key names, which work against GCS's
+key-range autoscaling at very high enqueue rates.
+
+### SDK configuration
 
 The library deliberately leaves retries to the native SDK clients (construction
 invariant: the caller owns the client). **Configure your SDK retryer and
@@ -87,12 +144,11 @@ hold duration:
   fine for reads, but on expiry all contenders race a CAS takeover and exactly
   one wins; the rest are billed a failed write. With many contenders (> ~50),
   raise `WithRetryInterval` so the herd thins out.
-- **Renew traffic.** Each held lock costs 2 requests per renew interval
-  (default 5 s). Holding thousands of distinct locks concurrently is a request
-  budget question, not a correctness one: total renew load =
-  2 × held locks / renew interval. Lengthen `WithLeaseDuration` (renew defaults
-  to lease/3) for many long-held locks; the price is slower crash recovery —
-  a dead holder's lock stays stuck for up to a full lease.
+- **Renew traffic.** Holding thousands of distinct locks concurrently is a
+  request-budget question, not a correctness one — see the lock capacity table
+  above. Lengthen `WithLeaseDuration` (renew defaults to lease/3) for many
+  long-held locks; the price is slower crash recovery — a dead holder's lock
+  stays stuck for up to a full lease.
 - **Don't fan many lockers into one key.** Use one lock per protected resource
   (`Acquire(ctx, key)` is per-key); the per-object write ceiling is per lock
   record, so distinct keys scale horizontally.
@@ -120,17 +176,9 @@ The queue's ceilings, in the order you will hit them:
    `WithQueueReceiveBackoff`'s cap; raising it trades delivery latency for
    standing cost.
 
-Throughput intuition: a claim is ~5 requests against the lease subtree and a
-listing; a single queue prefix sustains hundreds of messages/sec on S3/Azure
-before prefix limits or claim contention bite, and less on GCS if messages are
-claimed-renewed-acked rapidly (each lease record is a ~1 write/s object —
-claim + ack of one message is 2–3 writes to one lease key, so per-*message*
-rates are fine, but anything that rewrites one message's lease in a tight loop
-is not).
-
-Renew traffic scales like the lock's: 2 requests per held message per renew
-interval. A consumer holding 500 messages at the default 5 s renew adds
-200 req/s of pure heartbeat. Either hold fewer messages concurrently or raise
+Concrete throughput numbers are in the queue capacity table above. Renew
+traffic scales like the lock's — 2 requests per held message per renew
+interval — so either hold fewer messages concurrently or raise
 `WithQueueVisibilityLease`.
 
 ### Tail, Watcher, and Trim (the broadcast-log path)
