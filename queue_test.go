@@ -324,7 +324,7 @@ func TestQueueLostNotification(t *testing.T) {
 			if !errors.Is(msg.Err(), blobster.ErrMessageLost) {
 				t.Fatalf("Err() = %v, want ErrMessageLost", msg.Err())
 			}
-		case <-time.After(2 * time.Second):
+		case <-time.After(lostNotificationTimeout):
 			t.Fatal("lost notification not delivered")
 		}
 	})

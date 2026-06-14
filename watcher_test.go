@@ -220,7 +220,13 @@ func TestWatcherResumesFromCursorAfterRestart(t *testing.T) {
 	ctx := t.Context()
 	leader := mem.New()
 	follower := mem.New()
-	leaderQ := mustNewQueue(t, leader, "events/")
+	// Drive the leader's id clock by hand so the second wave lands in a strictly
+	// later millisecond than the first. Otherwise a same-millisecond id whose
+	// random UUID tiebreaker sorts below the cursor (parked at the first wave's
+	// max) is skipped forever by the lag-0 tail — wall-clock enqueues collide
+	// within a millisecond often enough to flake.
+	clock := newManualClock()
+	leaderQ := mustNewQueue(t, leader, "events/", blobster.WithQueueClock(clock.Now))
 	w, localQ := newTestWatcher(t, leaderQ, follower)
 
 	const n = 10
@@ -243,6 +249,7 @@ func TestWatcherResumesFromCursorAfterRestart(t *testing.T) {
 	waitForCursor(t, follower, maxID(firstIDs...))
 	stop()
 
+	clock.Advance(time.Second) // the second wave is strictly newer than the cursor
 	second := make(map[string]bool, n)
 	for i := range n {
 		id, err := leaderQ.Enqueue(ctx, strings.NewReader(fmt.Sprintf("b-%d", i)), nil)
@@ -317,7 +324,14 @@ func TestWatcherTakeover(t *testing.T) {
 	ctx := t.Context()
 	leader := mem.New()
 	follower := mem.New()
-	leaderQ := mustNewQueue(t, leader, "events/")
+	// Drive the leader's id clock by hand so every message id is strictly ordered
+	// by enqueue. wB takes over and tails the second wave *live* as it is written;
+	// with the lag-0 tail, two same-millisecond ids would let the tailer park its
+	// cursor on the higher one and skip a lower one written just after — lost for
+	// good. Advancing the clock per enqueue keeps every later id above the cursor,
+	// which is what a real lag window guarantees in production.
+	clock := newManualClock()
+	leaderQ := mustNewQueue(t, leader, "events/", blobster.WithQueueClock(clock.Now))
 	wA, localQ := newTestWatcher(t, leaderQ, follower)
 	wB, _ := newTestWatcher(t, leaderQ, follower)
 
@@ -342,6 +356,7 @@ func TestWatcherTakeover(t *testing.T) {
 	stopA()
 
 	for i := range n {
+		clock.Advance(time.Second) // each second-wave id strictly above the cursor and every prior id
 		id, err := leaderQ.Enqueue(ctx, strings.NewReader(fmt.Sprintf("b-%d", i)), nil)
 		if err != nil {
 			t.Fatalf("leader enqueue: %v", err)

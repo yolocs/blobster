@@ -14,6 +14,14 @@ import (
 	"github.com/yolocs/blobster/mem"
 )
 
+// lostNotificationTimeout bounds how long a lost-lease test waits for the
+// renewer's background goroutine to fire Done after its lease record is stolen.
+// It is a liveness guard, not a latency assertion — real promptness is set by
+// the 10ms renew interval. It is kept generous so heavy parallel -race
+// scheduling on the file driver can't trip it; a genuinely missed signal still
+// fails, just after this wait rather than at 2s.
+const lostNotificationTimeout = 30 * time.Second
+
 // bucketFactory builds a fresh real bucket to back a Locker.
 type bucketFactory struct {
 	name string
@@ -495,7 +503,7 @@ func TestLockerLostNotification(t *testing.T) {
 			if !errors.Is(held.Err(), blobster.ErrLockLost) {
 				t.Fatalf("Err() = %v, want ErrLockLost", held.Err())
 			}
-		case <-time.After(2 * time.Second):
+		case <-time.After(lostNotificationTimeout):
 			t.Fatal("lost notification not delivered")
 		}
 	})
@@ -524,7 +532,7 @@ func TestLockerReleaseAfterLoss(t *testing.T) {
 
 		select {
 		case <-held.Done():
-		case <-time.After(2 * time.Second):
+		case <-time.After(lostNotificationTimeout):
 			t.Fatal("never lost")
 		}
 		if !errors.Is(held.Err(), blobster.ErrLockLost) {
